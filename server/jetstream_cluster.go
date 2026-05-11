@@ -3781,7 +3781,7 @@ func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n Ra
 			}
 		}
 		if !foundAll {
-			fmt.Println("Waiting for group to expand")
+			//fmt.Println("Waiting for group to expand")
 			js.mu.RUnlock()
 			return false
 		}
@@ -3948,7 +3948,7 @@ func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n
 			}
 		}
 		if !foundAll {
-			fmt.Println("Waiting for group to expand")
+			//fmt.Println("Waiting for group to expand")
 			js.mu.RUnlock()
 			return false
 		}
@@ -7610,7 +7610,7 @@ func (js *jetStream) processStreamAssignmentUpdates(sub *subscription, c *client
 	}
 
 	if err := cc.meta.Propose(encodeUpdateStreamAssignment(sa)); err == nil {
-		fmt.Printf("Stream update to peers: %v\n", sa.Group.Peers)
+		//fmt.Printf("Stream update to peers: %v\n", sa.Group.Peers)
 		cc.trackInflightStreamProposal(acc.Name, sa, false)
 	}
 }
@@ -7659,7 +7659,7 @@ func (js *jetStream) processConsumerAssignmentUpdates(sub *subscription, c *clie
 	}
 
 	if err := cc.meta.Propose(encodeAddConsumerAssignment(ca)); err == nil {
-		fmt.Printf("Consumer update to peers: %v\n", ca.Group.Peers)
+		//fmt.Printf("Consumer update to peers: %v\n", ca.Group.Peers)
 		cc.trackInflightConsumerProposal(acc.Name, update.Stream, ca, false)
 	}
 }
