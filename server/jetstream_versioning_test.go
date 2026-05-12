@@ -400,9 +400,9 @@ func TestJetStreamMetadataMutations(t *testing.T) {
 	nc, js := jsClientConnect(t, single)
 	defer nc.Close()
 
-	cluster := createJetStreamClusterExplicit(t, "R3S", 3)
-	defer cluster.shutdown()
-	cnc, cjs := jsClientConnect(t, cluster.randomServer())
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+	cnc, cjs := jsClientConnect(t, c.randomServer())
 	defer cnc.Close()
 
 	// Test for both single server and clustered mode.
@@ -412,7 +412,7 @@ func TestJetStreamMetadataMutations(t *testing.T) {
 	} {
 		t.Run(fmt.Sprintf("R%d", s.replicas), func(t *testing.T) {
 			streamMetadataChecks(t, s)
-			consumerMetadataChecks(t, s)
+			consumerMetadataChecks(t, c, s)
 		})
 	}
 }
@@ -448,7 +448,7 @@ func streamMetadataChecks(t *testing.T, s server) {
 	require_True(t, validateMetadata(si.Config.Metadata, "0"))
 }
 
-func consumerMetadataChecks(t *testing.T, s server) {
+func consumerMetadataChecks(t *testing.T, c *cluster, s server) {
 	// Add consumer.
 	cc := nats.ConsumerConfig{Name: consumerName, Replicas: s.replicas}
 	ci, err := s.js.AddConsumer(streamName, &cc)
@@ -498,6 +498,7 @@ func consumerMetadataChecks(t *testing.T, s server) {
 		ci, err = s.js.UpdateConsumer(streamName, &cc)
 		require_NoError(t, err)
 		require_True(t, validateMetadata(ci.Config.Metadata, "0"))
+		c.waitOnConsumerLeader(globalAccountName, streamName, consumerName)
 
 		ci, err = s.js.ConsumerInfo(streamName, consumerName)
 		require_NoError(t, err)
@@ -508,6 +509,7 @@ func consumerMetadataChecks(t *testing.T, s server) {
 		ci, err = s.js.UpdateConsumer(streamName, &cc)
 		require_NoError(t, err)
 		require_True(t, validateMetadata(ci.Config.Metadata, "0"))
+		c.waitOnConsumerLeader(globalAccountName, streamName, consumerName)
 
 		ci, err = s.js.ConsumerInfo(streamName, consumerName)
 		require_NoError(t, err)

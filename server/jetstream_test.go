@@ -18201,7 +18201,10 @@ func addConsumerWithError(t *testing.T, nc *nats.Conn, cfg *CreateConsumerReques
 	if resp.Type != JSApiConsumerCreateResponseType {
 		t.Fatalf("Invalid response type %s expected %s", resp.Type, JSApiConsumerCreateResponseType)
 	}
-	return resp.ConsumerInfo, resp.Error
+	if resp.Error != nil {
+		return nil, resp.Error
+	}
+	return resp.ConsumerInfo, nil
 }
 
 func TestJetStreamSourceRemovalAndReAdd(t *testing.T) {
