@@ -5424,7 +5424,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	js.mu.RLock()
 	s, rg, desired := js.srv, sa.Group, sa.DesiredPlacement
 	client, subject, reply := sa.Client, sa.Subject, sa.Reply
-	alreadyRunning, oldNumReplicas, numReplicas := osa.Group.node != nil, len(osa.Group.Peers), len(rg.Peers)
+	alreadyRunning, numReplicas := osa.Group.node != nil, len(rg.Peers)
 	needsNode := rg.node == nil
 	storage, cfg := sa.Config.Storage, sa.Config
 	recovering := sa.recovering
@@ -5478,7 +5478,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			if !started {
 				mset.monitorWg.Done()
 			}
-		} else if numReplicas == 1 && alreadyRunning {
+		} else if numReplicas == 1 && desired == nil && alreadyRunning {
 			// We downgraded to R1. Make sure we cleanup the raft node and the stream monitor.
 			mset.removeNode()
 			mset.stopMonitoring()
@@ -5538,7 +5538,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	isLeader := mset.IsLeader()
 
 	// If the stream is scaled down, there is a chance we weren't already the leader.
-	if isLeader && numReplicas == 1 && oldNumReplicas > 1 {
+	if isLeader && numReplicas == 1 && desired == nil {
 		js.processStreamLeaderChange(mset, true)
 	}
 

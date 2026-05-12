@@ -5290,6 +5290,9 @@ func TestJetStreamClusterAccountUsageDrifts(t *testing.T) {
 	sir3, err = js.StreamInfo("TEST1")
 	require_NoError(t, err)
 
+	// Wait for the scale down to complete before scaling back up.
+	c.waitOnStreamLeader(aExpPub, "TEST1")
+
 	// Now scale back up.
 	_, err = js.UpdateStream(&nats.StreamConfig{
 		Name:     "TEST1",
@@ -5608,9 +5611,8 @@ func TestJetStreamClusterOrphanConsumerSubjects(t *testing.T) {
 		})
 		require_NoError(t, err)
 		c.waitOnAllCurrent()
+		c.waitOnStreamLeader("$G", "TEST")
 	}
-
-	c.waitOnStreamLeader("$G", "TEST")
 	c.waitOnConsumerLeader("$G", "TEST", "consumer_foo")
 
 	info, err := js.ConsumerInfo("TEST", "consumer_foo")
@@ -7387,6 +7389,10 @@ func TestJetStreamClusterStreamScaleDownChangesRaftGroup(t *testing.T) {
 		_, err = js.Publish("foo", []byte("B"))
 		require_NoError(t, err)
 	}
+
+	// Wait for scale down to finish.
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
 	cfg.Replicas = 3
 	_, err = js.UpdateStream(cfg)
 	require_NoError(t, err)
@@ -7490,6 +7496,7 @@ func TestJetStreamClusterStreamRescaleCatchup(t *testing.T) {
 		cfg.Replicas = 1
 		_, err = js.UpdateStream(cfg)
 		require_NoError(t, err)
+		c.waitOnStreamLeader(globalAccountName, "TEST")
 		cfg.Replicas = 3
 		_, err = js.UpdateStream(cfg)
 		require_NoError(t, err)
@@ -7635,10 +7642,14 @@ func TestJetStreamClusterConsumerScaleDownChangesRaftGroup(t *testing.T) {
 	n := mset.lookupConsumer("CONSUMER").raftNode()
 	old := n.Group()
 
-	// Scale stream down and back up.
+	// Scale consumer down and back up.
 	cfg.Replicas = 1
 	_, err = js.UpdateConsumer("TEST", cfg)
 	require_NoError(t, err)
+
+	// Wait for scale down to finish.
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+
 	cfg.Replicas = 3
 	_, err = js.UpdateConsumer("TEST", cfg)
 	require_NoError(t, err)
@@ -7720,10 +7731,11 @@ func TestJetStreamClusterConsumerRescaleCatchup(t *testing.T) {
 		rs.Shutdown()
 		rs.WaitForShutdown()
 
-		// Scale stream down and back up.
+		// Scale consumer down and back up.
 		cfg.Replicas = 1
 		_, err = js.UpdateConsumer("TEST", cfg)
 		require_NoError(t, err)
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
 		cfg.Replicas = 3
 		_, err = js.UpdateConsumer("TEST", cfg)
 		require_NoError(t, err)
