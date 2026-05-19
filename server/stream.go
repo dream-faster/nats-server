@@ -733,7 +733,7 @@ func (a *Account) addStreamWithAssignment(config *StreamConfig, fsConfig *FileSt
 		if isClustered {
 			_, reserved = js.tieredStreamAndReservationCount(a.Name, tier, cfg)
 		}
-		if err := js.checkAllLimits(&selected, cfg, reserved, 0); err != nil {
+		if err := js.checkAllLimits(&selected, tier, cfg, reserved, 0); err != nil {
 			js.mu.RUnlock()
 			return nil, err
 		}
@@ -2205,11 +2205,10 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server, pedan
 
 	// Save the user configured MaxBytes.
 	newMaxBytes := cfg.MaxBytes
-	maxBytesOffset := int64(0)
 
 	// We temporarily set cfg.MaxBytes to maxBytesDiff because checkAllLimits
 	// adds cfg.MaxBytes to the current reserved limit and checks if we've gone
-	// over. However, we don't want an addition cfg.MaxBytes, we only want to
+	// over. However, we don't want an additional cfg.MaxBytes, we only want to
 	// reserve the difference between the new and the old values.
 	cfg.MaxBytes = maxBytesDiff
 
@@ -2236,15 +2235,13 @@ func (jsa *jsAccount) configUpdateCheck(old, new *StreamConfig, s *Server, pedan
 	if isClustered {
 		_, reserved = js.tieredStreamAndReservationCount(acc.Name, tier, &cfg)
 	}
-	// reservation does not account for this stream, hence add the old value
-	if old.MaxBytes > 0 {
-		if tier == _EMPTY_ && old.Replicas > 1 {
-			reserved = addSaturate(reserved, mulSaturate(int64(old.Replicas), old.MaxBytes))
-		} else {
-			reserved = addSaturate(reserved, old.MaxBytes)
-		}
-	}
-	if err := js.checkAllLimits(&selected, &cfg, reserved, maxBytesOffset); err != nil {
+	// reserved covers only the other streams. checkAllLimits adds this stream's
+	// footprint via cfg.MaxBytes, which is currently maxBytesDiff, so it only
+	// adds the diff. Add the remaining (newMaxBytes - maxBytesDiff) here so the
+	// two together equal this stream's true new footprint, even when Replicas
+	// changes on update.
+	reserved = addSaturate(reserved, accountReservation(tier, cfg.Replicas, newMaxBytes-maxBytesDiff))
+	if err := js.checkAllLimits(&selected, tier, &cfg, reserved, 0); err != nil {
 		return nil, err
 	}
 	// Restore the user configured MaxBytes.
@@ -3029,7 +3026,7 @@ func (mset *stream) processInboundMirrorMsg(m *inMsg) bool {
 	if err != nil {
 		if strings.Contains(err.Error(), "no space left") {
 			s.Errorf("JetStream out of space, will be DISABLED")
-			s.DisableJetStream()
+			s.ShutdownJetStream()
 			return false
 		}
 		if err != errLastSeqMismatch {
@@ -4037,7 +4034,7 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 		s := mset.srv
 		if strings.Contains(err.Error(), "no space left") {
 			s.Errorf("JetStream out of space, will be DISABLED")
-			s.DisableJetStream()
+			s.ShutdownJetStream()
 		} else {
 			mset.mu.RLock()
 			accName, sname, iName := mset.acc.Name, mset.cfg.Name, si.iname
@@ -6220,7 +6217,7 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		if isPermissionError(err) {
 			// messages in block cache could be lost in the worst case.
 			// In the clustered mode it is very highly unlikely as a result of replication.
-			go mset.srv.DisableJetStream()
+			go mset.srv.ShutdownJetStream()
 			mset.srv.Warnf("Filesystem permission denied while writing msg, disabling JetStream: %v", err)
 			return err
 		}
@@ -7948,7 +7945,7 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 		}
 		bc += hdr.Size
 		js.mu.RLock()
-		err = js.checkAllLimits(&selected, &cfg, reserved, bc)
+		err = js.checkAllLimits(&selected, tier, &cfg, reserved, bc)
 		js.mu.RUnlock()
 		if err != nil {
 			return nil, err

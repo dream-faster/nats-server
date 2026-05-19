@@ -2114,18 +2114,22 @@ func (fs *fileStore) recoverTTLState() error {
 				// Done.
 				break
 			}
-			msg, _, err := mb.fetchMsgNoCopy(seq, &sm)
+			mb.mu.Lock()
+			msg, _, err := mb.fetchMsgNoCopyLocked(seq, &sm)
 			if err != nil {
+				mb.finishedWithCache()
+				mb.mu.Unlock()
 				fs.warn("Error loading msg seq %d for recovering TTL: %s", seq, err)
 				continue
 			}
-			if len(msg.hdr) == 0 {
-				continue
+			if len(msg.hdr) > 0 {
+				if ttl, _ := getMessageTTL(msg.hdr); ttl > 0 {
+					expires := time.Duration(msg.ts) + (time.Second * time.Duration(ttl))
+					fs.ttls.Add(seq, int64(expires))
+				}
 			}
-			if ttl, _ := getMessageTTL(msg.hdr); ttl > 0 {
-				expires := time.Duration(msg.ts) + (time.Second * time.Duration(ttl))
-				fs.ttls.Add(seq, int64(expires))
-			}
+			mb.finishedWithCache()
+			mb.mu.Unlock()
 		}
 	}
 	return nil
@@ -2195,18 +2199,22 @@ func (fs *fileStore) recoverMsgSchedulingState() error {
 				// Done.
 				break
 			}
-			msg, _, err := mb.fetchMsgNoCopy(seq, &sm)
+			mb.mu.Lock()
+			msg, _, err := mb.fetchMsgNoCopyLocked(seq, &sm)
 			if err != nil {
+				mb.finishedWithCache()
+				mb.mu.Unlock()
 				fs.warn("Error loading msg seq %d for recovering message schedules: %s", seq, err)
 				continue
 			}
-			if len(msg.hdr) == 0 {
-				continue
+			if len(msg.hdr) > 0 {
+				if schedule, ok := getMessageSchedule(msg.hdr); ok && !schedule.IsZero() {
+					// Copy the subject, as it's stored in the scheduling maps and the backing cache could be reused in the meantime.
+					fs.scheduling.init(seq, copyString(msg.subj), schedule.UnixNano())
+				}
 			}
-			if schedule, ok := getMessageSchedule(sm.hdr); ok && !schedule.IsZero() {
-				// Copy the subject, as it's stored in the scheduling maps and the backing cache could be reused in the meantime.
-				fs.scheduling.init(seq, copyString(sm.subj), schedule.UnixNano())
-			}
+			mb.finishedWithCache()
+			mb.mu.Unlock()
 		}
 	}
 	return nil
@@ -2641,6 +2649,7 @@ func (fs *fileStore) GetSeqFromTime(t time.Time) uint64 {
 
 	// Using a binary search, but need to be aware of interior deletes in the block.
 	seq := lseq + 1
+	mb.mu.Lock()
 loop:
 	for fseq <= lseq {
 		mid := fseq + (lseq-fseq)/2
@@ -2648,7 +2657,7 @@ loop:
 		// Potentially skip over gaps. We keep the original middle but keep track of a
 		// potential delete range with an offset.
 		for {
-			sm, _, err := mb.fetchMsgNoCopy(mid+off, &smv)
+			sm, _, err := mb.fetchMsgNoCopyLocked(mid+off, &smv)
 			if err != nil || sm == nil {
 				off++
 				if mid+off <= lseq {
@@ -2675,6 +2684,8 @@ loop:
 			fseq = mid + off + 1
 		}
 	}
+	mb.finishedWithCache()
+	mb.mu.Unlock()
 	return seq
 }
 
@@ -5345,7 +5356,6 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 		lhdr, lmsg int
 		ttl        int64
 	)
-	// We don't use a copy as long as that's possible. When unlocking mb or erasing, we'll copy the subject.
 	sm, err := mb.cacheLookupNoCopy(seq, &smv)
 	if err != nil {
 		finishedWithCache()
@@ -5357,7 +5367,9 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 		}
 		return false, err
 	} else if sm != nil {
-		subj = sm.subj
+		// subj aliases mb.cache.buf; copy now because the cache may be erased or
+		// recycled after we drop mb.mu. The rest are scalars stashed for later use.
+		subj = copyString(sm.subj)
 		ts = sm.ts
 		lhdr = len(sm.hdr)
 		lmsg = len(sm.msg)
@@ -5369,8 +5381,6 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 	// when the last block is empty.
 	// If not via limits and not empty (empty writes tombstone below if last) write tombstone.
 	if !viaLimits && !isEmpty && sm != nil {
-		// Need to copy the subject since we unlock and re-acquire, and the cache could change.
-		subj = copyString(subj)
 		mb.mu.Unlock() // Only safe way to checkLastBlock is to unlock here...
 		lmb, err := fs.checkLastBlock(emptyRecordLen)
 		if err != nil {
@@ -5402,9 +5412,6 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 			fsUnlock()
 			return false, err
 		}
-		// Need to copy the subject, as eraseMsg will overwrite the cache and we won't
-		// be able to access sm.subj anymore later on.
-		subj = copyString(subj)
 		if err := mb.eraseMsg(seq, int(ri), int(msz), isLastBlock); err != nil {
 			finishedWithCache()
 			mb.mu.Unlock()
@@ -6043,10 +6050,9 @@ func (mb *msgBlock) selectNextFirst() {
 	var smv StoreMsg
 	sm, _ := mb.cacheLookupNoCopy(seq, &smv)
 	if sm == nil {
-		// Slow path, need to unlock.
-		mb.mu.Unlock()
-		sm, _, _ = mb.fetchMsgNoCopy(seq, &smv)
-		mb.mu.Lock()
+		// Slow path, cache not loaded.
+		sm, _, _ = mb.fetchMsgNoCopyLocked(seq, &smv)
+		mb.finishedWithCache()
 	}
 	if sm != nil {
 		mb.first.ts = sm.ts
@@ -7848,25 +7854,25 @@ checkCache:
 // We assume the block was selected and is correct, so we do not do range checks.
 // Lock should not be held.
 func (mb *msgBlock) fetchMsg(seq uint64, sm *StoreMsg) (*StoreMsg, bool, error) {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	defer mb.finishedWithCache()
 	return mb.fetchMsgEx(seq, sm, true)
 }
 
 // Fetch a message from this block, possibly reading in and caching the messages.
 // We assume the block was selected and is correct, so we do not do range checks.
-// We will not copy the msg data.
-// Lock should not be held.
-func (mb *msgBlock) fetchMsgNoCopy(seq uint64, sm *StoreMsg) (*StoreMsg, bool, error) {
+// We will not copy the msg data, the returned StoreMsg's subj/hdr/msg/buf are aliased
+// into mb.cache.buf and are only safe to read while mb.mu is held.
+func (mb *msgBlock) fetchMsgNoCopyLocked(seq uint64, sm *StoreMsg) (*StoreMsg, bool, error) {
 	return mb.fetchMsgEx(seq, sm, false)
 }
 
 // Fetch a message from this block, possibly reading in and caching the messages.
 // We assume the block was selected and is correct, so we do not do range checks.
 // We will copy the msg data based on doCopy boolean.
-// Lock should not be held.
+// Lock should be held.
 func (mb *msgBlock) fetchMsgEx(seq uint64, sm *StoreMsg, doCopy bool) (*StoreMsg, bool, error) {
-	mb.mu.Lock()
-	defer mb.mu.Unlock()
-
 	fseq, lseq := atomic.LoadUint64(&mb.first.seq), atomic.LoadUint64(&mb.last.seq)
 	if seq < fseq || seq > lseq {
 		return nil, false, ErrStoreMsgNotFound
@@ -7888,7 +7894,6 @@ func (mb *msgBlock) fetchMsgEx(seq uint64, sm *StoreMsg, doCopy bool) (*StoreMsg
 			return nil, false, err
 		}
 	}
-	defer mb.finishedWithCache()
 	llseq := mb.llseq
 
 	fsm, err := mb.cacheLookupEx(seq, sm, doCopy)
@@ -7896,7 +7901,7 @@ func (mb *msgBlock) fetchMsgEx(seq uint64, sm *StoreMsg, doCopy bool) (*StoreMsg
 		return nil, false, err
 	}
 	expireOk := (seq == lseq && llseq == seq-1) || (seq == fseq && llseq == seq+1)
-	return fsm, expireOk, err
+	return fsm, expireOk, nil
 }
 
 var (
@@ -8064,9 +8069,15 @@ func (fs *fileStore) sizeForSeq(seq uint64) int {
 	}
 	var smv StoreMsg
 	if mb := fs.selectMsgBlock(seq); mb != nil {
-		if sm, _, _ := mb.fetchMsgNoCopy(seq, &smv); sm != nil {
-			return int(fileStoreMsgSize(sm.subj, sm.hdr, sm.msg))
+		mb.mu.Lock()
+		sm, _, _ := mb.fetchMsgNoCopyLocked(seq, &smv)
+		var sz int
+		if sm != nil {
+			sz = int(fileStoreMsgSize(sm.subj, sm.hdr, sm.msg))
 		}
+		mb.finishedWithCache()
+		mb.mu.Unlock()
+		return sz
 	}
 	return 0
 }
@@ -8256,9 +8267,17 @@ func (fs *fileStore) SubjectForSeq(seq uint64) (string, error) {
 	mb := fs.selectMsgBlock(seq)
 	fs.mu.RUnlock()
 	if mb != nil {
-		if sm, _, _ := mb.fetchMsgNoCopy(seq, &smv); sm != nil {
+		mb.mu.Lock()
+		sm, _, _ := mb.fetchMsgNoCopyLocked(seq, &smv)
+		var subj string
+		if sm != nil {
 			// Copy the subject, as it's used elsewhere, and the backing cache could be reused in the meantime.
-			return copyString(sm.subj), nil
+			subj = copyString(sm.subj)
+		}
+		mb.finishedWithCache()
+		mb.mu.Unlock()
+		if sm != nil {
+			return subj, nil
 		}
 	}
 	return _EMPTY_, ErrStoreMsgNotFound
@@ -9775,20 +9794,31 @@ func (fs *fileStore) Truncate(seq uint64) error {
 	// at the end, after we release the lock.
 	os.Remove(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile))
 
-	var lsm *StoreMsg
+	var hasLsm bool
+	var lastTime int64
 	smb := fs.selectMsgBlock(seq)
 	if smb != nil {
-		lsm, _, _ = smb.fetchMsgNoCopy(seq, nil)
+		smb.mu.Lock()
+		lsm, _, err := smb.fetchMsgNoCopyLocked(seq, nil)
+		if lsm != nil {
+			hasLsm = true
+			lastTime = lsm.ts
+		}
+		smb.finishedWithCache()
+		smb.mu.Unlock()
+		if err != nil && err != ErrStoreMsgNotFound && err != errDeletedMsg {
+			fs.mu.Unlock()
+			return err
+		}
 	}
 
 	// Reset last so new block doesn't contain truncated sequences/timestamps.
-	var lastTime int64
-	if lsm != nil {
-		lastTime = lsm.ts
-	} else if smb != nil {
-		lastTime = smb.last.ts
-	} else {
-		lastTime = fs.state.LastTime.UnixNano()
+	if !hasLsm {
+		if smb != nil {
+			lastTime = smb.last.ts
+		} else {
+			lastTime = fs.state.LastTime.UnixNano()
+		}
 	}
 	fs.state.LastSeq = seq
 	fs.state.LastTime = time.Unix(0, lastTime).UTC()
@@ -9810,8 +9840,11 @@ func (fs *fileStore) Truncate(seq uint64) error {
 
 	// If the selected block is not found or the message was deleted, we'll need to write a tombstone
 	// at the truncated sequence so we don't roll backward on our last sequence and timestamp.
-	if lsm == nil || removeSmb {
-		fs.writeTombstone(seq, lastTime)
+	if !hasLsm || removeSmb {
+		if err = fs.writeTombstone(seq, lastTime); err != nil {
+			fs.mu.Unlock()
+			return err
+		}
 	}
 
 	var purged, bytes uint64
@@ -10585,7 +10618,7 @@ func (fs *fileStore) flushStreamStateLoop(qch, done chan struct{}) {
 				fs.warn("File system permission denied when flushing stream state, disabling JetStream: %v", err)
 				// messages in block cache could be lost in the worst case.
 				// In the clustered mode it is very highly unlikely as a result of replication.
-				fs.srv.DisableJetStream()
+				fs.srv.ShutdownJetStream()
 				return
 			}
 
@@ -11755,8 +11788,18 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 		return ErrNoAckPolicy
 	}
 
+	var kick bool
+	defer func() {
+		if kick {
+			o.kickFlusher()
+		}
+	}()
+
 	// We do this regardless.
-	delete(o.state.Redelivered, sseq)
+	if _, ok := o.state.Redelivered[sseq]; ok {
+		delete(o.state.Redelivered, sseq)
+		kick = true
+	}
 
 	// On restarts the old leader may get a replay from the raft logs that are old.
 	if dseq <= o.state.AckFloor.Consumer {
@@ -11767,7 +11810,10 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 		return ErrStoreMsgNotFound
 	}
 
-	// Check for AckAll here.
+	// Done with the consistency checks, we'll always kick for below updates.
+	kick = true
+
+	// Check for AckAll here (or AckFlowControl which functions like AckAll).
 	if o.cfg.AckPolicy == AckAll {
 		sgap := sseq - o.state.AckFloor.Stream
 		o.state.AckFloor.Consumer = dseq
@@ -11785,7 +11831,6 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 				delete(o.state.Redelivered, seq)
 			}
 		}
-		o.kickFlusher()
 		return nil
 	}
 
@@ -11817,8 +11862,6 @@ func (o *consumerFileStore) UpdateAcks(dseq, sseq uint64) error {
 			}
 		}
 	}
-
-	o.kickFlusher()
 	return nil
 }
 
