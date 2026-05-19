@@ -4974,6 +4974,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 	storage, cfg := sa.Config.Storage, sa.Config
 	recovering := sa.recovering
 	hasResponded := sa.markResponded()
+	hadErr := sa.err != nil
 	js.mu.RUnlock()
 
 	mset, err := acc.lookupStream(cfg.Name)
@@ -5066,6 +5067,10 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		// Send response to the metadata leader. They will forward to the user as needed.
 		s.sendInternalMsgLocked(streamAssignmentSubj, _EMPTY_, nil, result)
 		return
+	} else if hadErr {
+		js.mu.Lock()
+		sa.err = nil
+		js.mu.Unlock()
 	}
 
 	isLeader := mset.IsLeader()
@@ -5122,6 +5127,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 	storage := sa.Config.Storage
 	restore := sa.Restore
 	recovering := sa.recovering
+	hadErr := sa.err != nil
 	js.mu.RUnlock()
 
 	// Process the raft group and make sure it's running if needed.
@@ -5264,6 +5270,10 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 			s.sendInternalMsgLocked(streamAssignmentSubj, _EMPTY_, nil, result)
 		}
 		return
+	} else if hadErr {
+		js.mu.Lock()
+		sa.err = nil
+		js.mu.Unlock()
 	}
 
 	// Re-capture node.
@@ -5948,8 +5958,14 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 		}
 	} else {
 		js.mu.RLock()
+		hadErr := ca.err != nil
 		node := rg.node
 		js.mu.RUnlock()
+		if hadErr {
+			js.mu.Lock()
+			ca.err = nil
+			js.mu.Unlock()
+		}
 
 		if didCreate {
 			o.setCreatedTime(ca.Created)
