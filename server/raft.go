@@ -68,7 +68,6 @@ type RaftNode interface {
 	PeerNames() []string
 	Peers() []*Peer
 	ProposeKnownPeers(knownPeers []string)
-	UpdateKnownPeers(knownPeers []string)
 	UpdateAllowedPeers(peers []string)
 	ProposeAddPeer(peer string) error
 	ProposeRemovePeer(peer string) error
@@ -2173,13 +2172,6 @@ func (n *raft) ProposeKnownPeers(knownPeers []string) {
 	}
 	n.updateKnownPeersLocked(knownPeers)
 	n.sendPeerState()
-}
-
-// Update our known set of peers.
-func (n *raft) UpdateKnownPeers(knownPeers []string) {
-	n.Lock()
-	n.updateKnownPeersLocked(knownPeers)
-	n.Unlock()
 }
 
 func (n *raft) updateKnownPeersLocked(knownPeers []string) {
