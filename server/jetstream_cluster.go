@@ -5042,7 +5042,7 @@ func (js *jetStream) processStreamLeaderChange(mset *stream, isLeader bool) {
 			Created:   mset.createdTime(),
 			State:     mset.state(),
 			Config:    *setDynamicStreamMetadata(&msetCfg),
-			Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
+			Cluster:   js.clusterInfo(mset.raftGroup()),
 			Sources:   mset.sourcesInfo(),
 			Mirror:    mset.mirrorInfo(),
 			TimeStamp: time.Now().UTC(),
@@ -5624,7 +5624,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		Created:   mset.createdTime(),
 		State:     mset.state(),
 		Config:    *setDynamicStreamMetadata(&msetCfg),
-		Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
+		Cluster:   js.clusterInfo(mset.raftGroup()),
 		Mirror:    mset.mirrorInfo(),
 		Sources:   mset.sourcesInfo(),
 		TimeStamp: time.Now().UTC(),
@@ -5694,7 +5694,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 								Created:   mset.createdTime(),
 								State:     mset.state(),
 								Config:    *setDynamicStreamMetadata(&msetCfg),
-								Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
+								Cluster:   js.clusterInfo(mset.raftGroup()),
 								Sources:   mset.sourcesInfo(),
 								Mirror:    mset.mirrorInfo(),
 								TimeStamp: time.Now().UTC(),
@@ -11223,9 +11223,10 @@ func (js *jetStream) clusterInfo(rg *raftGroup) *ClusterInfo {
 	if js == nil {
 		return nil
 	}
+
 	js.mu.RLock()
 	s := js.srv
-	if rg == nil || rg.node == nil {
+	if rg == nil || (rg.node == nil && rg.Desired == nil) {
 		js.mu.RUnlock()
 		return &ClusterInfo{
 			Name:   s.cachedClusterName(),
@@ -11238,103 +11239,28 @@ func (js *jetStream) clusterInfo(rg *raftGroup) *ClusterInfo {
 	n := rg.node
 	rgName := rg.Name
 	rgPeers := slices.Clone(rg.Peers)
+	var (
+		desired      *DesiredClusterInfo
+		desiredPeers []string
+	)
+	if d := rg.Desired; d != nil && d.Group != nil {
+		desired = &DesiredClusterInfo{
+			Name:      d.Group.Cluster,
+			RaftGroup: d.Group.Name,
+			Placement: d.Placement,
+		}
+		desiredPeers = slices.Clone(d.Group.Peers)
+	}
 	js.mu.RUnlock()
 
 	ci := &ClusterInfo{
-		Name:        s.cachedClusterName(),
-		Leader:      s.serverNameForNode(n.GroupLeader()),
-		LeaderSince: n.LeaderSince(),
-		SystemAcc:   n.IsSystemAccount(),
-		TrafficAcc:  n.GetTrafficAccountName(),
-		RaftGroup:   rgName,
-	}
-
-	now := time.Now()
-	id, peers := n.ID(), n.Peers()
-
-	// If we are leaderless, do not suppress putting us in the peer list.
-	if ci.Leader == _EMPTY_ {
-		id = _EMPTY_
-	}
-
-	for _, rp := range peers {
-		if rp.ID != id && slices.Contains(rgPeers, rp.ID) {
-			var lastSeen time.Duration
-			if now.After(rp.Last) && !rp.Last.IsZero() {
-				lastSeen = now.Sub(rp.Last)
-			}
-			current := rp.Current
-			if current && lastSeen > lostQuorumInterval {
-				current = false
-			}
-			// Create a peer info with common settings if the peer has not been seen
-			// yet (which can happen after the whole cluster is stopped and only some
-			// of the nodes are restarted).
-			pi := &PeerInfo{
-				Current: current,
-				Offline: true,
-				Active:  lastSeen,
-				Lag:     rp.Lag,
-				Peer:    rp.ID,
-			}
-			// If node is found, complete/update the settings.
-			if sir, ok := s.nodeToInfo.Load(rp.ID); ok && sir != nil {
-				si := sir.(nodeInfo)
-				pi.Name, pi.Offline, pi.cluster = si.name, si.offline, si.cluster
-			} else {
-				// If not, then add a name that indicates that the server name
-				// is unknown at this time, and clear the lag since it is misleading
-				// (the node may not have that much lag).
-				// Note: We return now the Peer ID in PeerInfo, so the "(peerID: %s)"
-				// would technically not be required, but keeping it for now.
-				pi.Name, pi.Lag = fmt.Sprintf("Server name unknown at this time (peerID: %s)", rp.ID), 0
-			}
-			ci.Replicas = append(ci.Replicas, pi)
-		}
-	}
-	// Order the result based on the name so that we get something consistent
-	// when doing repeated stream info in the CLI, etc...
-	slices.SortFunc(ci.Replicas, func(i, j *PeerInfo) int { return cmp.Compare(i.Name, j.Name) })
-	return ci
-}
-
-// clusterInfoOfGroup builds the ClusterInfo for a stream's or consumer's raft
-// group, including any in-flight desired placement carried on the group. The
-// group may be nil (e.g. not assigned here yet), in which case a minimal
-// ClusterInfo is returned.
-func (js *jetStream) clusterInfoOfGroup(rg *raftGroup) *ClusterInfo {
-	if js == nil {
-		return nil
-	}
-	js.mu.RLock()
-	defer js.mu.RUnlock()
-	return js.clusterInfoWithDesired(rg)
-}
-
-// Lock should be held.
-func (js *jetStream) clusterInfoWithDesired(rg *raftGroup) *ClusterInfo {
-	s := js.srv
-	if rg == nil || (rg.node == nil && rg.Desired == nil) {
-		return &ClusterInfo{
-			Name:   s.cachedClusterName(),
-			Leader: s.Name(),
-		}
-	}
-
-	ci := &ClusterInfo{
 		Name:      s.cachedClusterName(),
-		RaftGroup: rg.Name,
+		RaftGroup: rgName,
 		Leader:    s.Name(),
 	}
 
-	var desiredRg *raftGroup
-	if rg.Desired != nil && rg.Desired.Group != nil {
-		desiredRg = rg.Desired.Group
-	}
-
 	id := s.Node()
-	if n := rg.node; n != nil {
-		ci.RaftGroup = n.Group()
+	if n != nil {
 		ci.Leader = s.serverNameForNode(n.GroupLeader())
 		ci.LeaderSince = n.LeaderSince()
 		ci.SystemAcc = n.IsSystemAccount()
@@ -11345,10 +11271,10 @@ func (js *jetStream) clusterInfoWithDesired(rg *raftGroup) *ClusterInfo {
 			id = _EMPTY_
 		}
 
-		peers, now := n.Peers(), time.Now()
-		for _, rp := range peers {
+		now := time.Now()
+		for _, rp := range n.Peers() {
 			// The peer is either in the actual or desired peer set.
-			if rp.ID != id && (rg.isMember(rp.ID) || (desiredRg != nil && desiredRg.isMember(rp.ID))) {
+			if rp.ID != id && (slices.Contains(rgPeers, rp.ID) || slices.Contains(desiredPeers, rp.ID)) {
 				var lastSeen time.Duration
 				if now.After(rp.Last) && !rp.Last.IsZero() {
 					lastSeen = now.Sub(rp.Last)
@@ -11370,7 +11296,7 @@ func (js *jetStream) clusterInfoWithDesired(rg *raftGroup) *ClusterInfo {
 				// If node is found, complete/update the settings.
 				if sir, ok := s.nodeToInfo.Load(rp.ID); ok && sir != nil {
 					si := sir.(nodeInfo)
-					pi.Name, pi.Offline = si.name, si.offline
+					pi.Name, pi.Offline, pi.cluster = si.name, si.offline, si.cluster
 				} else {
 					// If not, then add a name that indicates that the server name
 					// is unknown at this time, and clear the lag since it is misleading
@@ -11393,7 +11319,7 @@ func (js *jetStream) clusterInfoWithDesired(rg *raftGroup) *ClusterInfo {
 		// If node is found, complete/update the settings.
 		if sir, ok := s.nodeToInfo.Load(peer); ok && sir != nil {
 			si := sir.(nodeInfo)
-			pi.Name, pi.Offline = si.name, si.offline
+			pi.Name, pi.Offline, pi.cluster = si.name, si.offline, si.cluster
 		} else {
 			// If not, then add a name that indicates that the server name
 			// is unknown at this time, and clear the lag since it is misleading
@@ -11404,13 +11330,9 @@ func (js *jetStream) clusterInfoWithDesired(rg *raftGroup) *ClusterInfo {
 		}
 		return pi
 	}
-	if desiredRg != nil {
-		ci.Desired = &DesiredClusterInfo{
-			Name:      desiredRg.Cluster,
-			RaftGroup: desiredRg.Name,
-			Placement: rg.Desired.Placement,
-		}
-		for _, peer := range desiredRg.Peers {
+	if desired != nil {
+		ci.Desired = desired
+		for _, peer := range desiredPeers {
 			pi := generatePeer(peer)
 			ci.Desired.Replicas = append(ci.Desired.Replicas, pi)
 
@@ -11421,8 +11343,8 @@ func (js *jetStream) clusterInfoWithDesired(rg *raftGroup) *ClusterInfo {
 			ci.Replicas = append(ci.Replicas, pi)
 		}
 	}
-	for _, peer := range rg.Peers {
-		// Skip if the desired peer is already present.
+	for _, peer := range rgPeers {
+		// Skip if the peer is already present.
 		if peer == id || slices.ContainsFunc(ci.Replicas, func(info *PeerInfo) bool { return info.Peer == peer }) {
 			continue
 		}
@@ -11525,7 +11447,7 @@ func (mset *stream) processClusterStreamInfoRequest(reply string) {
 		Created:   mset.createdTime(),
 		State:     mset.state(),
 		Config:    config,
-		Cluster:   js.clusterInfoOfGroup(mset.raftGroup()),
+		Cluster:   js.clusterInfo(mset.raftGroup()),
 		Sources:   mset.sourcesInfo(),
 		Mirror:    mset.mirrorInfo(),
 		TimeStamp: time.Now().UTC(),

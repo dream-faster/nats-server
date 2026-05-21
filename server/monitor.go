@@ -3133,7 +3133,8 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optDire
 
 	if js := s.getJetStream(); js != nil && optStreams {
 		for _, stream := range streams {
-			ci := js.clusterInfoOfGroup(stream.raftGroup())
+			rgroup := stream.raftGroup()
+			ci := js.clusterInfo(rgroup)
 			var cfg *StreamConfig
 			if optCfg {
 				c := stream.config()
@@ -3152,8 +3153,8 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optDire
 				Mirror:  stream.mirrorInfo(),
 				Sources: stream.sourcesInfo(),
 			}
-			if optRaft && ci.RaftGroup != _EMPTY_ {
-				sdet.RaftGroup = ci.RaftGroup
+			if optRaft && rgroup != nil {
+				sdet.RaftGroup = rgroup.Name
 				sdet.ConsumerRaftGroups = make([]*RaftGroupDetail, 0)
 			}
 			if optConsumers {
