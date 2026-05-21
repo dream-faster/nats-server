@@ -58,6 +58,12 @@ const (
 	// Prefix for loop detection subject
 	leafNodeLoopDetectionSubjectPrefix = "$LDS."
 
+	// Prefix used by the "_LR_" leaf reply mechanism. A leaf reply subject
+	// looks like "_LR_.<srvHash>.<original-inbox>", where srvHash identifies
+	// the server that owns the inbox. This mirrors the gateway "_GR_" prefix.
+	leafReplyPrefix  = "_LR_."
+	leafReplyHashLen = 8
+
 	// Path added to URL to indicate to WS server that the connection is a
 	// LEAF connection as opposed to a CLIENT.
 	leafNodeWSPath = "/leafnode"
@@ -2499,7 +2505,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 			if len(sub.queue) > 0 && sub.qw > 0 {
 				count = sub.qw
 			}
-			c.leaf.smap[keyFromSub(sub)] += count
+			c.leaf.smap[c.leafSmapKey(sub)] += count
 			if c.leaf.tsub == nil {
 				c.leaf.tsub = make(map[*subscription]struct{})
 			}
@@ -2686,7 +2692,7 @@ func (c *client) updateSmap(sub *subscription, delta int32, isLDS bool) {
 		}
 	}
 
-	key := keyFromSub(sub)
+	key := c.leafSmapKey(sub)
 	n, ok := c.leaf.smap[key]
 	if delta < 0 && !ok {
 		return
@@ -2753,7 +2759,8 @@ func (c *client) sendLeafNodeSubUpdate(key string, n int32) {
 		if len(key) > 0 && (key[0] == '$' || key[0] == '_') {
 			if strings.HasPrefix(key, leafNodeLoopDetectionSubjectPrefix) ||
 				strings.HasPrefix(key, oldGWReplyPrefix) ||
-				strings.HasPrefix(key, gwReplyPrefix) {
+				strings.HasPrefix(key, gwReplyPrefix) ||
+				strings.HasPrefix(key, leafReplyPrefix) {
 				checkPerms = false
 			}
 		}
@@ -2777,6 +2784,40 @@ func (c *client) sendLeafNodeSubUpdate(key string, n int32) {
 }
 
 // Helper function to build the key.
+// Avoid per-call allocations when prefix-checking subjects on hot paths.
+var (
+	leafReplyPrefixBytes = []byte(leafReplyPrefix)
+	leafInboxPrefixBytes = []byte("_INBOX.")
+)
+
+// leafNodeReplyEnabled reports whether the "_LR_" inbox interest compaction
+// is enabled on this server.
+func (s *Server) leafNodeReplyEnabled() bool {
+	return s != nil && s.lrReplyPfx != nil
+}
+
+// isInboxSubject reports whether subj is a client inbox subject (_INBOX.<...>).
+func isInboxSubject(subj []byte) bool {
+	return bytes.HasPrefix(subj, leafInboxPrefixBytes)
+}
+
+// isLeafReplySubject reports whether subj carries the "_LR_" leaf reply prefix.
+func isLeafReplySubject(subj []byte) bool {
+	return bytes.HasPrefix(subj, leafReplyPrefixBytes)
+}
+
+// leafSmapKey returns the key under which sub is advertised to a leaf
+// connection. With compaction enabled, a local client inbox subscription is
+// collapsed under this server's single "_LR_" reply wildcard so that unique
+// _INBOX.<nuid> subjects are not propagated individually.
+func (c *client) leafSmapKey(sub *subscription) string {
+	if sub.queue == nil && sub.client != nil && sub.client.kind == CLIENT &&
+		c.srv.leafNodeReplyEnabled() && isInboxSubject(sub.subject) {
+		return c.srv.lrReplyWildcard
+	}
+	return keyFromSub(sub)
+}
+
 func keyFromSub(sub *subscription) string {
 	var sb strings.Builder
 	sb.Grow(len(sub.subject) + len(sub.queue) + 1)
@@ -2924,7 +2965,8 @@ func (c *client) processLeafSub(argo []byte) (err error) {
 	if sub.subject[0] == '$' || sub.subject[0] == '_' {
 		if ldsPrefix ||
 			bytes.HasPrefix(sub.subject, []byte(oldGWReplyPrefix)) ||
-			bytes.HasPrefix(sub.subject, []byte(gwReplyPrefix)) {
+			bytes.HasPrefix(sub.subject, []byte(gwReplyPrefix)) ||
+			isLeafReplySubject(sub.subject) {
 			checkPerms = false
 		}
 	}
@@ -3241,7 +3283,7 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 	c.in.msgs++
 	c.in.bytes += int32(len(msg) - LEN_CR_LF)
 
-	srv, acc, subject := c.srv, c.acc, string(c.pa.subject)
+	srv, acc := c.srv, c.acc
 
 	// Mostly under testing scenarios.
 	if srv == nil || acc == nil {
@@ -3253,6 +3295,15 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 		c.leafPubPermViolation(c.pa.subject)
 		return
 	}
+
+	// "_LR_" leaf reply: if this is a compacted inbox reply destined for this
+	// server, restore the original _INBOX subject before matching so it finds
+	// the local inbox subscription. The prefix carries this server's hash, so
+	// only replies that belong here are restored.
+	if srv.leafNodeReplyEnabled() && bytes.HasPrefix(c.pa.subject, srv.lrReplyPfx) {
+		c.pa.subject = c.pa.subject[len(srv.lrReplyPfx):]
+	}
+	subject := string(c.pa.subject)
 
 	// Match the subscriptions. We will use our own L1 map if
 	// it's still valid, avoiding contention on the shared sublist.
@@ -3330,10 +3381,10 @@ func (c *client) leafMsgAllowed() bool {
 	// Strip any gateway routing prefix for the permission check.
 	subjectToCheck, isGW := getGWRoutedSubjectOrSelf(wireSubject)
 
-	// Service-import replies (_R_), JS ack subjects ($JS.ACK.)
-	// are internal routing subjects forwarded via LS+ without
+	// Service-import replies (_R_), JS ack subjects ($JS.ACK.) and "_LR_"
+	// leaf replies are internal routing subjects forwarded via LS+ without
 	// permission checks.
-	if isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck) {
+	if isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck) || isLeafReplySubject(subjectToCheck) {
 		return true
 	}
 

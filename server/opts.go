@@ -229,6 +229,14 @@ type LeafNodeOpts struct {
 	// east-west propagation.
 	IsolateLeafnodeInterest bool `json:"-"`
 
+	// CompactInboxInterest enables the "_LR_" leaf reply mechanism: local
+	// client inbox (_INBOX.) subscriptions are advertised across leaf
+	// connections as a single per-server reply wildcard instead of one
+	// LS+ per unique inbox subject. Request reply subjects crossing the leaf
+	// are rewritten to that prefix and restored on the originating server.
+	// This trims the propagated interest graph (see _GR_ for gateways).
+	CompactInboxInterest bool `json:"-"`
+
 	// Not exported, for tests.
 	resolver    netResolver
 	dialTimeout time.Duration

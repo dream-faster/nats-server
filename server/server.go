@@ -271,6 +271,11 @@ type Server struct {
 	gatewayListenerErr error
 	gateway            *srvGateway
 
+	// For the "_LR_" leaf reply mechanism (LeafNode.CompactInboxInterest).
+	// Set once at startup and read-only afterwards.
+	lrReplyPfx      []byte // "_LR_.<srvHash>." or nil when disabled
+	lrReplyWildcard string // "_LR_.<srvHash>.>"
+
 	// Used by tests to check that http.Servers do
 	// not set any timeout.
 	monitoringServer *http.Server
@@ -861,6 +866,15 @@ func NewServer(opts *Options) (*Server, error) {
 	// it to be nil or not in various places in the code.
 	if err := s.newGateway(opts); err != nil {
 		return nil, err
+	}
+
+	// Initialize the "_LR_" leaf reply prefix used to compact inbox interest
+	// across leaf nodes. The per-server hash lets a reply route back to the
+	// one originating server, mirroring the gateway "_GR_" reply prefix.
+	if opts.LeafNode.CompactInboxInterest {
+		h := getHashSize(s.info.ID, leafReplyHashLen)
+		s.lrReplyPfx = []byte(leafReplyPrefix + h + ".")
+		s.lrReplyWildcard = leafReplyPrefix + h + ".>"
 	}
 
 	// If we have a cluster definition but do not have a cluster name, create one.

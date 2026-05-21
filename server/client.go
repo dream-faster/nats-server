@@ -5561,6 +5561,17 @@ sendToRoutesOrLeafs:
 		reply = append(reply, deliver...)
 	}
 
+	// "_LR_" leaf reply: when forwarding a local client's request across a leaf
+	// node, advertise the inbox reply under this server's compact reply prefix
+	// (the original inbox is appended after it) so per-inbox interest does not
+	// need to propagate. Computed once since the prefix is per-server.
+	var leafReplya [256]byte
+	var leafReply []byte
+	if len(reply) > 0 && c.kind == CLIENT && c.srv.leafNodeReplyEnabled() && isInboxSubject(reply) {
+		leafReply = append(leafReplya[:0], c.srv.lrReplyPfx...)
+		leafReply = append(leafReply, reply...)
+	}
+
 	// Copy off original pa in case it changes.
 	pa := c.pa
 
@@ -5608,8 +5619,13 @@ sendToRoutesOrLeafs:
 			hset = true
 		}
 
-		mh := c.msgHeaderForRouteOrLeaf(subject, reply, rt, acc)
-		if c.deliverMsg(prodIsMQTT, rt.sub, acc, subject, reply, mh, dmsg, false) {
+		// For leaf destinations, use the compacted "_LR_" reply if applicable.
+		rpl := reply
+		if leafReply != nil && dc.kind == LEAF {
+			rpl = leafReply
+		}
+		mh := c.msgHeaderForRouteOrLeaf(subject, rpl, rt, acc)
+		if c.deliverMsg(prodIsMQTT, rt.sub, acc, subject, rpl, mh, dmsg, false) {
 			if rt.sub.icb == nil {
 				dlvMsgs++
 				switch dc.kind {
