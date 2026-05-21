@@ -8877,30 +8877,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 					if cca.Config.Replicas != 0 {
 						cca.Config.Replicas = len(newPeers)
 					}
-					// Check if all peers are invalid. This can happen with R1 under replicated streams that are being scaled down.
-					if len(needReplace) == len(ca.Group.Peers) {
-						// We have to transfer state to new peers.
-						// we will grab our state and attach to the new assignment.
-						// TODO(dlc) - In practice we would want to make sure the consumer is paused.
-						// Need to release js lock.
-						js.mu.Unlock()
-						if ci, err := sysRequest[ConsumerInfo](s, clusterConsumerInfoT, acc, osa.Config.Name, ca.Name); err != nil {
-							s.Warnf("Did not receive consumer info results for '%s > %s > %s' due to: %s", acc, osa.Config.Name, ca.Name, err)
-						} else if ci != nil {
-							cca.State = &ConsumerState{
-								Delivered: SequencePair{
-									Consumer: ci.Delivered.Consumer,
-									Stream:   ci.Delivered.Stream,
-								},
-								AckFloor: SequencePair{
-									Consumer: ci.AckFloor.Consumer,
-									Stream:   ci.AckFloor.Stream,
-								},
-							}
-						}
-						// Re-acquire here.
-						js.mu.Lock()
-					}
 
 					// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
 					// FIXME(mvv): should this still be done when scaling down to R1?
