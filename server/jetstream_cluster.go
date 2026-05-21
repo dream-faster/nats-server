@@ -165,11 +165,7 @@ type raftGroup struct {
 	Preferred string      `json:"preferred,omitempty"`
 	ScaleUp   bool        `json:"scale_up,omitempty"`
 	// Desired holds the target placement while this group is being moved or
-	// scaled; it is nil when the group is stable. It travels with the group so
-	// that membership/leader/cluster-info logic can reason over current+desired
-	// peers without the caller needing to know whether the group belongs to a
-	// stream or a consumer. Invariant: Desired.Group is a leaf, i.e.
-	// Desired.Group.Desired is always nil (placement is only ever one level deep).
+	// scaled; it is nil when the group is stable.
 	Desired *desiredGroupPlacement `json:"desired,omitempty"`
 	// Internal
 	node RaftNode
@@ -3832,7 +3828,9 @@ func (s *Server) selectPeerToRemove(n RaftNode, remaining []string) string {
 	return best
 }
 
-// TODO(mvv): docs
+// runStreamMigration drives a stream's Raft group from its current peer set toward
+// its target peer set during a move or scale. It returns true when the migration is
+// completed. Without a desired state, it falls back to the legacy migration.
 func (js *jetStream) runStreamMigration(mset *stream, sa *streamAssignment, n RaftNode) bool {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
@@ -4029,7 +4027,9 @@ func (mset *stream) isMigrating() bool {
 	return false
 }
 
-// TODO(mvv): docs
+// runConsumerMigration drives a consumer's Raft group from its current peer set toward
+// its target peer set during a move or scale. It returns true when the migration is
+// completed. Without a desired state, it falls back to the legacy migration.
 func (js *jetStream) runConsumerMigration(o *consumer, ca *consumerAssignment, n RaftNode) bool {
 	ourPeerId, cc, s := n.ID(), js.cluster, js.srv
 
@@ -7665,7 +7665,9 @@ type assignmentUpdateActualPlacement struct {
 	Peers     []string   `json:"peers,omitempty"`
 }
 
-// TODO(mvv): docs
+// processStreamAssignmentUpdates runs on the meta leader and reconciles a stream's
+// committed assignment with the actual placement reported by the stream leader during a
+// migration by runStreamMigration.
 func (js *jetStream) processStreamAssignmentUpdates(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
 	var update streamAssignmentUpdate
 	if err := json.Unmarshal(msg, &update); err != nil {
@@ -7721,7 +7723,9 @@ func (js *jetStream) processStreamAssignmentUpdates(sub *subscription, c *client
 	}
 }
 
-// TODO(mvv): docs
+// processConsumerAssignmentUpdates runs on the meta leader and reconciles a consumer's
+// committed assignment with the actual placement reported by the consumer leader during a
+// migration by runConsumerMigration.
 func (js *jetStream) processConsumerAssignmentUpdates(sub *subscription, c *client, _ *Account, subject, reply string, msg []byte) {
 	var update consumerAssignmentUpdate
 	if err := json.Unmarshal(msg, &update); err != nil {
@@ -8966,10 +8970,6 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 
 			// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
 			// FIXME(mvv): should this still be done when scaling down to R1?
-			// cca.Group currently holds the new (scaled/moved) peer set: that is the
-			// desired state. Keep the current group as an independent copy of the live
-			// consumer group and attach the desired placement to it, so the committed
-			// assignment's group is never mutated.
 			desiredGroup := cca.Group
 			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
 			cca.Group = ca.Group.copyGroup()
@@ -9000,11 +9000,8 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 	}
 	sa := &streamAssignment{Group: osa.Group, Sync: syncSubject, Created: osa.Created, Config: newCfg, Subject: subject, Reply: reply, Client: ci}
 	if isMoveRequest || isReplicaChange {
-		// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
 		// FIXME(mvv): should this still be done when scaling down to R1?
-		// rg already holds the desired peer set (a copy of osa.Group). Attach it as
-		// the desired placement on an independent copy of the current group so the
-		// committed osa.Group is never mutated.
+		// Set the desired state.
 		rg.Desired = nil // leaf invariant: desired groups never nest
 		sa.Group = osa.Group.copyGroup()
 		sa.Group.Desired = &desiredGroupPlacement{
@@ -9012,7 +9009,7 @@ func (s *Server) jsClusteredStreamUpdateRequest(ci *ClientInfo, acc *Account, su
 			Placement: newCfg.Placement,
 			Group:     rg,
 		}
-		// TODO(mvv): docs, reset placement
+		// Keep the current placement unchanged, the desired state contains the new placement.
 		newCfg.Placement = osa.Config.Placement
 	}
 	if err := meta.Propose(encodeUpdateStreamAssignment(sa)); err != nil {
@@ -10125,12 +10122,7 @@ func (s *Server) jsClusteredConsumerRequest(ci *ClientInfo, acc *Account, subjec
 		nca.Reply = reply
 
 		if rBefore != rAfter {
-			// TODO(mvv): docs, preserve peers but optionally need to change the name if scaling up/to R1
 			// FIXME(mvv): should this still be done when scaling down to R1?
-			// nca.Group currently holds the new (scaled) peer set: that is the desired
-			// state. Keep the current group as an independent copy of the live consumer
-			// group and attach the desired placement to it, so the committed assignment's
-			// group is never mutated.
 			desiredGroup := nca.Group
 			desiredGroup.Desired = nil // leaf invariant: desired groups never nest
 			nca.Group = ca.Group.copyGroup()
