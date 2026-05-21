@@ -5369,17 +5369,12 @@ func (js *jetStream) processUpdateStreamAssignment(sa *streamAssignment) {
 	}
 
 	// Copy over private existing state from former SA.
-	if sa.Group != nil {
+	// Unless we're a single-replica stream, not part of a move/scale.
+	if sa.Group != nil && !(sa.Config.Replicas == 1 && sa.Group.Desired == nil) {
 		sa.Group.node = osa.Group.node
 	}
 	sa.consumers = osa.consumers
 	sa.err = osa.err
-
-	// If we detect we are scaling down to 1, non-clustered, and we had a previous node, clear it here.
-	// FIXME(mvv): this is unsafe
-	if sa.Config.Replicas == 1 && sa.Group.node != nil && sa.Group.Desired == nil {
-		sa.Group.node = nil
-	}
 
 	// Update our state.
 	accStreams[stream] = sa
