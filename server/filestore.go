@@ -9144,11 +9144,10 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 		if sequence > 1 {
 			return fs.compact(sequence)
 		}
-	}
-
-	// Make sure to not leave subject if empty and we reach this spot.
-	if subject == _EMPTY_ {
-		subject = fwcs
+		// Make sure to not leave subject if empty.
+		if subject == _EMPTY_ {
+			subject = fwcs
+		}
 	}
 
 	eq, wc := compareFn(subject), subjectHasWildcard(subject)
