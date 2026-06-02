@@ -2812,7 +2812,7 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 				nca := ca.copyGroup()
 				nca.Reply = _EMPTY_
 				nca.Group.Desired = nil
-				if err := cc.meta.Propose(encodeAddConsumerAssignment(nca)); err == nil {
+				if err = cc.meta.Propose(encodeAddConsumerAssignment(nca)); err == nil {
 					cc.trackInflightConsumerProposal(accName, streamName, nca, false)
 				}
 			}

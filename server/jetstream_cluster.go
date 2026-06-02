@@ -2591,7 +2591,9 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 	}
 
 	// Send our proposal for this csa. Also use same group definition for all the consumers as well.
-	cc.meta.Propose(encodeAddStreamAssignment(csa))
+	if err := cc.meta.Propose(encodeAddStreamAssignment(csa)); err != nil {
+		return false
+	}
 	cc.trackInflightStreamProposal(accName, csa, false)
 	rg := csa.Group
 	for ca := range js.consumerAssignmentsOrInflightSeq(accName, sa.Config.Name) {
@@ -2602,12 +2604,14 @@ func (js *jetStream) removePeerFromStreamLocked(sa *streamAssignment, peer strin
 		if ca.Config.Durable != _EMPTY_ {
 			cca := ca.copyGroup()
 			cca.Group.Peers, cca.Group.Preferred = rg.Peers, _EMPTY_
-			cc.meta.Propose(encodeAddConsumerAssignment(cca))
-			cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
+			if err := cc.meta.Propose(encodeAddConsumerAssignment(cca)); err == nil {
+				cc.trackInflightConsumerProposal(accName, csa.Config.Name, cca, false)
+			}
 		} else if ca.Group.isCurrentMember(peer) {
 			// These are ephemerals. Check to see if we deleted this peer.
-			cc.meta.Propose(encodeDeleteConsumerAssignment(ca))
-			cc.trackInflightConsumerProposal(accName, csa.Config.Name, ca, true)
+			if err := cc.meta.Propose(encodeDeleteConsumerAssignment(ca)); err == nil {
+				cc.trackInflightConsumerProposal(accName, csa.Config.Name, ca, true)
+			}
 		}
 	}
 	return replaced
