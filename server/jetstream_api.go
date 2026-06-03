@@ -2800,30 +2800,31 @@ func (s *Server) jsLeaderServerStreamCancelMoveRequest(sub *subscription, c *cli
 		nsa := sa.copyGroup()
 		nsa.Reply = _EMPTY_
 		nsa.Group.Desired = nil
-		proposeErr := cc.meta.Propose(encodeUpdateStreamAssignment(nsa))
-		if proposeErr == nil {
-			cc.trackInflightStreamProposal(accName, nsa, false)
-			// Cancel any consumer moves that were started as part of this stream move too,
-			// otherwise they would keep migrating to the new peer set.
-			for _, ca := range sa.consumers {
-				if ca.Group == nil || ca.Group.Desired == nil {
-					continue
-				}
-				nca := ca.copyGroup()
-				nca.Reply = _EMPTY_
-				nca.Group.Desired = nil
-				if err = cc.meta.Propose(encodeAddConsumerAssignment(nca)); err == nil {
-					cc.trackInflightConsumerProposal(accName, streamName, nca, false)
-				}
-			}
-		}
-		js.mu.Unlock()
-
-		if proposeErr != nil {
+		if err = cc.meta.Propose(encodeUpdateStreamAssignment(nsa)); err != nil {
+			js.mu.Unlock()
 			resp.Error = NewJSClusterNotAvailError()
 			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 			return
 		}
+		cc.trackInflightStreamProposal(accName, nsa, false)
+
+		// Cancel any consumer moves that were started as part of this stream move too,
+		// otherwise they would keep migrating to the new peer set.
+		for _, ca := range sa.consumers {
+			if ca.Group == nil || ca.Group.Desired == nil {
+				continue
+			}
+			nca := ca.copyGroup()
+			nca.Reply = _EMPTY_
+			nca.Group.Desired = nil
+			if err = cc.meta.Propose(encodeAddConsumerAssignment(nca)); err != nil {
+				js.mu.Unlock()
+				// Don't send a response, some prior proposals might still go through, so let them time out.
+				return
+			}
+			cc.trackInflightConsumerProposal(accName, streamName, nca, false)
+		}
+		js.mu.Unlock()
 
 		s.Noticef("Requested cancel of move for stream '%s > %s', restoring peer set %+v",
 			accName, streamName, s.peerSetToNames(restorePeers))
