@@ -8712,8 +8712,8 @@ func BenchmarkFileStoreConsumerStoreConcurrentDiskIO(b *testing.B) {
 		name string
 		dios *diskIOSemaphore
 	}{
-		{name: "default_dios", dios: defaultDiskIOSemaphore()},
-		{name: "unbounded_dios", dios: newDiskIOSemaphore(consumersPerIteration)},
+		{name: "default_dios", dios: defaultDiskIOSemaphore("default")},
+		{name: "unbounded_dios", dios: newDiskIOSemaphore("unbounded", consumersPerIteration)},
 	} {
 		b.Run(test.name, func(b *testing.B) {
 			storeRoot := benchmarkDir(b)

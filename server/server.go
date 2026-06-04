@@ -772,7 +772,7 @@ func NewServer(opts *Options) (*Server, error) {
 		rateLimitLoggingCh: make(chan time.Duration, 1),
 		leafNodeEnabled:    opts.LeafNode.Port != 0 || len(opts.LeafNode.Remotes) > 0,
 		syncOutSem:         make(chan struct{}, maxConcurrentSyncRequests),
-		dios:               defaultDiskIOSemaphore(),
+		dios:               defaultDiskIOSemaphore(serverName),
 	}
 
 	// Delayed API response queue. Create regardless if JetStream is configured
@@ -4765,7 +4765,7 @@ func (s *Server) LDMClientByID(id uint64) error {
 
 func (s *Server) diskIOSemaphore() *diskIOSemaphore {
 	if s == nil || s.dios == nil {
-		return defaultDiskIOSemaphore()
+		return defaultDiskIOSemaphore("default")
 	}
 	return s.dios
 }

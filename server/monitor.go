@@ -4061,8 +4061,9 @@ func (s *Server) Healthz(opts *HealthzOptions) *HealthStatus {
 }
 
 type ExpvarzStatus struct {
-	Memstats json.RawMessage `json:"memstats"`
-	Cmdline  json.RawMessage `json:"cmdline"`
+	Memstats  json.RawMessage `json:"memstats"`
+	Cmdline   json.RawMessage `json:"cmdline"`
+	IOWaiters json.RawMessage `json:"io_waiters,omitempty"`
 }
 
 func (s *Server) expvarz(_ *ExpvarzEventOptions) *ExpvarzStatus {
@@ -4070,6 +4071,7 @@ func (s *Server) expvarz(_ *ExpvarzEventOptions) *ExpvarzStatus {
 
 	const memStatsKey = "memstats"
 	const cmdLineKey = "cmdline"
+	const ioWaitersKey = "io_waiters"
 
 	expvar.Do(func(v expvar.KeyValue) {
 		switch v.Key {
@@ -4078,6 +4080,9 @@ func (s *Server) expvarz(_ *ExpvarzEventOptions) *ExpvarzStatus {
 
 		case cmdLineKey:
 			stat.Cmdline = json.RawMessage(v.Value.String())
+
+		case ioWaitersKey:
+			stat.IOWaiters = json.RawMessage(v.Value.String())
 		}
 	})
 

@@ -14,26 +14,33 @@
 package server
 
 import (
+	"expvar"
 	"runtime"
 	"sync/atomic"
 )
 
+var diosWaitersExpvar = expvar.NewMap("io_waiters")
+
 // Used to limit number of disk IO calls in flight since they could all be blocking an OS thread.
 // https://github.com/nats-io/nats-server/issues/2742
 type diskIOSemaphore struct {
+	name    string
 	ch      chan struct{}
 	waiters atomic.Int64
 }
 
-func newDiskIOSemaphore(n int) *diskIOSemaphore {
-	d := &diskIOSemaphore{ch: make(chan struct{}, n)}
+func newDiskIOSemaphore(name string, n int) *diskIOSemaphore {
+	d := &diskIOSemaphore{name: name, ch: make(chan struct{}, n)}
 	for range n {
 		d.ch <- struct{}{}
 	}
+	diosWaitersExpvar.Set(name, expvar.Func(func() any {
+		return d.waiters.Load()
+	}))
 	return d
 }
 
-func defaultDiskIOSemaphore() *diskIOSemaphore {
+func defaultDiskIOSemaphore(name string) *diskIOSemaphore {
 	// Limit ourselves to a sensible number of blocking I/O calls.
 	// Range between 4-16 concurrent disk I/Os based on CPU cores,
 	// or 50% of cores if greater than 32 cores.
@@ -43,7 +50,7 @@ func defaultDiskIOSemaphore() *diskIOSemaphore {
 		// If the system has more than 32 cores then limit dios to 50% of cores.
 		nIO = max(16, min(mp, mp/2))
 	}
-	return newDiskIOSemaphore(nIO)
+	return newDiskIOSemaphore(name, nIO)
 }
 
 func (d *diskIOSemaphore) acquire() {
