@@ -11661,6 +11661,109 @@ func TestLeafNodeIsolatedLeafSubjectPropagationLocalIsolation(t *testing.T) {
 	}
 }
 
+func TestLeafNodeIsolatedLeafSubjectPropagationHubSubscription(t *testing.T) {
+	hubTmpl := `
+		port: -1
+		server_name: "%s"
+		accounts {
+			HA { users: [{user: HA, password: pwd}] }
+		}
+		leafnodes {
+			port: -1
+			isolate_leafnode_interest: true
+		}
+	`
+	confH := createConfFile(t, []byte(fmt.Sprintf(hubTmpl, "H1")))
+	sh, oh := RunServerWithConfig(confH)
+	defer sh.Shutdown()
+
+	spokeTmpl := `
+		port: -1
+		server_name: "%s"
+		accounts {
+			A { users: [{user: A, password: pwd}] }
+		}
+		leafnodes {
+			remotes [
+				{
+					url: "nats://HA:pwd@127.0.0.1:%d"
+					local: "A"
+				}
+			]
+		}
+	`
+
+	confSP1 := createConfFile(t, []byte(fmt.Sprintf(spokeTmpl, "SP1", oh.LeafNode.Port)))
+	sp1, _ := RunServerWithConfig(confSP1)
+	defer sp1.Shutdown()
+
+	confSP2 := createConfFile(t, []byte(fmt.Sprintf(spokeTmpl, "SP2", oh.LeafNode.Port)))
+	sp2, _ := RunServerWithConfig(confSP2)
+	defer sp2.Shutdown()
+
+	checkLeafNodeConnectedCount(t, sh, 2)
+	checkLeafNodeConnectedCount(t, sp1, 1)
+	checkLeafNodeConnectedCount(t, sp2, 1)
+
+	// The hub should still propagate its own interest to both spokes.
+	for _, c := range sh.leafs {
+		require_True(t, c.leaf.isolated)
+	}
+	for _, c := range sp1.leafs {
+		require_False(t, c.leaf.isolated)
+	}
+	for _, c := range sp2.leafs {
+		require_False(t, c.leaf.isolated)
+	}
+
+	nch := natsConnect(t, sh.ClientURL(), nats.UserInfo("HA", "pwd"))
+	nc1 := natsConnect(t, sp1.ClientURL(), nats.UserInfo("A", "pwd"))
+	nc2 := natsConnect(t, sp2.ClientURL(), nats.UserInfo("A", "pwd"))
+
+	subj := "isolated.subject"
+	hsub, err := nch.SubscribeSync(subj)
+	require_NoError(t, err)
+	checkSubInterest(t, sh, "HA", subj, time.Second)
+	checkSubInterest(t, sp1, "A", subj, time.Second)
+	checkSubInterest(t, sp2, "A", subj, time.Second)
+
+	// Create subscribers on both spokes after the hub has propagated interest.
+	ssub1, err := nc1.SubscribeSync(subj)
+	require_NoError(t, err)
+	ssub2, err := nc2.SubscribeSync(subj)
+	require_NoError(t, err)
+
+	// Publish from one leaf. The hub should receive it, the other leaf shouldn't.
+	m := nats.NewMsg(subj)
+	m.Data = []byte("leaf-interest-delivery")
+	require_NoError(t, nc1.PublishMsg(m))
+	require_NoError(t, nc1.Flush())
+
+	msg := natsNexMsg(t, hsub, time.Second)
+	require_True(t, bytes.Equal(msg.Data, m.Data))
+
+	msg = natsNexMsg(t, ssub1, time.Second)
+	require_True(t, bytes.Equal(msg.Data, m.Data))
+
+	_, err = ssub2.NextMsg(100 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	// Now publish from the hub. Both leafnodes should receive this one.
+	m = nats.NewMsg(subj)
+	m.Data = []byte("hub-publish-delivery")
+	require_NoError(t, nch.PublishMsg(m))
+	require_NoError(t, nch.Flush())
+
+	msg = natsNexMsg(t, hsub, time.Second)
+	require_True(t, bytes.Equal(msg.Data, m.Data))
+
+	msg = natsNexMsg(t, ssub1, time.Second)
+	require_True(t, bytes.Equal(msg.Data, m.Data))
+
+	msg = natsNexMsg(t, ssub2, time.Second)
+	require_True(t, bytes.Equal(msg.Data, m.Data))
+}
+
 func TestLeafNodeDaisyChainWithAccountImportExport(t *testing.T) {
 	hubConf := createConfFile(t, []byte(`
 		server_name: hub

@@ -5593,6 +5593,11 @@ sendToRoutesOrLeafs:
 		// If so make sure we do not send it back to the same cluster for a different
 		// leafnode. Cluster wide no echo.
 		if dc.kind == LEAF {
+			// Do not forward a message that arrived from one leaf to another isolated leaf.
+			// Hub-originated delivery can still reach isolated leafs via the normal client path.
+			if c.kind == LEAF && dc.isIsolatedLeafNode() {
+				continue
+			}
 			// Check two scenarios. One is inbound from a route (c.pa.origin),
 			// and the other is leaf to leaf. In both case, leafOrigin is the one
 			// to use for the comparison.
