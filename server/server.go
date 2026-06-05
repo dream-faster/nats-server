@@ -191,6 +191,7 @@ type Server struct {
 	sysAcc              atomic.Pointer[Account]
 	js                  atomic.Pointer[jetStream]
 	dios                *diskIOSemaphore
+	raftDios            *diskIOSemaphore
 	isMetaLeader        atomic.Bool
 	jsClustered         atomic.Bool
 	accounts            sync.Map
@@ -773,6 +774,7 @@ func NewServer(opts *Options) (*Server, error) {
 		leafNodeEnabled:    opts.LeafNode.Port != 0 || len(opts.LeafNode.Remotes) > 0,
 		syncOutSem:         make(chan struct{}, maxConcurrentSyncRequests),
 		dios:               defaultDiskIOSemaphore(serverName),
+		raftDios:           newDiskIOSemaphore(serverName+"-raft", 512),
 	}
 
 	// Delayed API response queue. Create regardless if JetStream is configured
@@ -4768,4 +4770,11 @@ func (s *Server) diskIOSemaphore() *diskIOSemaphore {
 		return defaultDiskIOSemaphore("default")
 	}
 	return s.dios
+}
+
+func (s *Server) raftDiskIOSemaphore() *diskIOSemaphore {
+	if s == nil || s.raftDios == nil {
+		return defaultDiskIOSemaphore("default-raft")
+	}
+	return s.raftDios
 }
