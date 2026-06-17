@@ -7544,7 +7544,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 
 // processJetStreamFastBatchMsg processes a JetStream message that's part of an atomic batch publish.
 // Handles constraints around the batch, storing messages, doing consistency checks, and performing the commit.
-func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, reply string, hdr, msg []byte, mt *msgTrace) (retErr error) {
+func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, reply string, hdr, msg []byte, mt *msgTrace, pbuf *fastBatchProposalBuffer) (retErr error) {
 	mset.mu.RLock()
 	canRespond := !mset.cfg.NoAck && len(reply) > 0
 	name, stype := mset.cfg.Name, mset.cfg.Storage
@@ -7702,6 +7702,13 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 
 	// A ping operation confirms we've received a minimum amount of data and resends ack messages.
 	if batch.ping {
+		if pbuf != nil {
+			if err := pbuf.flush(mset, node); err != nil {
+				batches.mu.Unlock()
+				mset.mu.Unlock()
+				return err
+			}
+		}
 		sendFlowControl := true
 		// Detect a gap or if the batch was cleaned up in the meantime.
 		if batch.seq > b.lseq || cleanup {
@@ -7763,6 +7770,13 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 
 	if batch.commit {
 		if batch.commitEob {
+			if pbuf != nil {
+				if err := pbuf.flush(mset, node); err != nil {
+					batches.mu.Unlock()
+					mset.mu.Unlock()
+					return err
+				}
+			}
 			// Revert, since we incremented for the gap check.
 			b.lseq--
 			// If there is none pending, correct the persisted sequence as we need to commit below.
@@ -7770,11 +7784,15 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 				b.pseq = b.lseq
 			}
 		}
-		// We'll try to immediately send a PubAck if we can.
-		// Only possible if EOB is used and the last message was already persisted
-		// Otherwise, this sets up the commit for the last message we're about to propose.
-		cleanup = batches.fastBatchCommit(b, batch.id, mset, reply)
+		if !batch.commitEob && !isClustered {
+			// Preserve the original standalone behavior where the commit state is visible
+			// before the message is stored and acknowledged.
+			cleanup = batches.fastBatchCommit(b, batch.id, mset, reply)
+		}
 		if batch.commitEob {
+			// We'll try to immediately send a PubAck if we can.
+			// Only possible if EOB is used and the last message was already persisted.
+			cleanup = batches.fastBatchCommit(b, batch.id, mset, reply)
 			if cleanup {
 				b.cleanupLocked(batch.id, batches)
 			}
@@ -7808,13 +7826,17 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		err    error
 	)
 	diff := &batchStagedDiff{}
+	if pbuf != nil && (pbuf.empty() || pbuf.currentBatchID() == batch.id) {
+		diff = &pbuf.diff
+	}
 	if hdr, msg, dseq, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubject, subject, hdr, msg, false, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
 		mset.clMu.Unlock()
 
 		// If the message is a duplicate, and we have no pending messages, we should check if we need to
 		// send the flow control message here.
 		if err == errMsgIdDuplicate {
-			if b.pending == 0 {
+			hasBuffered := pbuf != nil && !pbuf.empty() && pbuf.currentBatchID() == batch.id
+			if b.pending == 0 && !hasBuffered {
 				b.pseq = batch.seq
 				b.checkFlowControl(mset, reply, batches)
 			}
@@ -7865,15 +7887,26 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		batches.mu.Unlock()
 		return err
 	}
-	b.pending++
-	batches.mu.Unlock()
 	if !isClustered {
+		b.pending++
+		batches.mu.Unlock()
 		mset.clMu.Unlock()
 		return mset.processJetStreamMsgWithBatch(subject, reply, hdr, msg, 0, 0, mt, false, true, batch)
 	}
-	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq)
+	if pbuf == nil {
+		b.pending++
+		batches.mu.Unlock()
+		err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq)
+		mset.clMu.Unlock()
+		return err
+	}
+	batches.mu.Unlock()
+	pbuf.stage(mset, subject, reply, hdr, msg, mt, batch, b, jsa, name, r, lseq)
 	mset.clMu.Unlock()
-	return err
+	if batch.commit || pbuf.shouldFlush(batch.id, b.ackMessages) {
+		return pbuf.flush(mset, node)
+	}
+	return nil
 }
 
 // Used to signal inbound message to registered consumers.
@@ -8107,6 +8140,7 @@ func (mset *stream) internalLoop() {
 		szb   [10]byte
 		hdb   [10]byte
 	)
+	var fastProposals fastBatchProposalBuffer
 
 	for {
 		select {
@@ -8172,17 +8206,24 @@ func (mset *stream) internalLoop() {
 			for _, im := range ims {
 				// If we are clustered we need to propose this message to the underlying raft group.
 				if batch, err := getFastBatch(im.rply, im.hdr); batch != nil || err {
-					mset.processJetStreamFastBatchMsg(batch, im.subj, im.rply, im.hdr, im.msg, im.mt)
+					if batch == nil || fastProposals.shouldFlush(batch.id, 0) || batch.ping || batch.commitEob {
+						_ = fastProposals.flush(mset, mset.node)
+					}
+					mset.processJetStreamFastBatchMsg(batch, im.subj, im.rply, im.hdr, im.msg, im.mt, &fastProposals)
 					batch.returnToPool()
 				} else if batchId := getBatchId(im.hdr); batchId != _EMPTY_ {
+					_ = fastProposals.flush(mset, mset.node)
 					mset.processJetStreamAtomicBatchMsg(batchId, im.subj, im.rply, im.hdr, im.msg, im.mt)
 				} else if isClustered {
+					_ = fastProposals.flush(mset, mset.node)
 					mset.processClusteredInboundMsg(im.subj, im.rply, im.hdr, im.msg, im.mt, false)
 				} else {
+					_ = fastProposals.flush(mset, mset.node)
 					mset.processJetStreamMsg(im.subj, im.rply, im.hdr, im.msg, 0, 0, im.mt, false, true)
 				}
 				im.returnToPool()
 			}
+			_ = fastProposals.flush(mset, mset.node)
 			msgs.recycle(&ims)
 		case <-gets.ch:
 			dgs := gets.pop()

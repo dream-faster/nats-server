@@ -1053,6 +1053,150 @@ func recalculateClusteredSeq(mset *stream, needStreamLock bool) (lseq uint64) {
 	return lseq
 }
 
+type stagedFastBatchProposal struct {
+	entry   *Entry
+	b       *fastBatch
+	batchID string
+	reply   string
+	mt      *msgTrace
+	clseq   uint64
+	commit  bool
+}
+
+type fastBatchProposalBuffer struct {
+	diff       batchStagedDiff
+	staged     []stagedFastBatchProposal
+	entries    []*Entry
+	startClseq uint64
+	lseq       uint64
+	replicas   int
+	name       string
+	jsa        *jsAccount
+	totalSize  int
+}
+
+func (b *fastBatchProposalBuffer) empty() bool {
+	return len(b.staged) == 0
+}
+
+func (b *fastBatchProposalBuffer) currentBatchID() string {
+	if len(b.staged) == 0 {
+		return _EMPTY_
+	}
+	return b.staged[0].batchID
+}
+
+func (b *fastBatchProposalBuffer) reset() {
+	b.diff = batchStagedDiff{}
+	b.staged = b.staged[:0]
+	b.entries = b.entries[:0]
+	b.startClseq = 0
+	b.lseq = 0
+	b.replicas = 0
+	b.name = _EMPTY_
+	b.jsa = nil
+	b.totalSize = 0
+}
+
+func (b *fastBatchProposalBuffer) stage(
+	mset *stream, subject, reply string, hdr, msg []byte, mt *msgTrace, fb *FastBatch, state *fastBatch,
+	jsa *jsAccount, name string, replicas int, lseq uint64,
+) {
+	if len(b.staged) == 0 {
+		b.startClseq = mset.clseq
+		b.lseq = lseq
+		b.replicas = replicas
+		b.name = name
+		b.jsa = jsa
+	}
+	clseq := mset.clseq
+	esm := encodeStreamMsgAllowCompress(subject, reply, hdr, msg, clseq, time.Now().UnixNano(), false)
+	b.staged = append(b.staged, stagedFastBatchProposal{
+		entry:   newEntry(EntryNormal, esm),
+		b:       state,
+		batchID: fb.id,
+		reply:   reply,
+		mt:      mt,
+		clseq:   clseq,
+		commit:  fb.commit,
+	})
+	b.entries = append(b.entries, b.staged[len(b.staged)-1].entry)
+	b.totalSize += len(esm)
+	mset.clseq++
+}
+
+func (b *fastBatchProposalBuffer) shouldFlush(batchID string, ackMessages uint16) bool {
+	if len(b.staged) == 0 {
+		return false
+	}
+	if current := b.currentBatchID(); current != _EMPTY_ && batchID != current {
+		return true
+	}
+	if ackMessages > 0 && len(b.staged) >= int(ackMessages) {
+		return true
+	}
+	const maxBatchSize = 256 * 1024
+	return b.totalSize >= maxBatchSize
+}
+
+func (b *fastBatchProposalBuffer) flush(mset *stream, node RaftNode) error {
+	if len(b.staged) == 0 {
+		return nil
+	}
+	if err := node.ProposeMulti(b.entries); err != nil {
+		mset.clMu.Lock()
+		mset.clseq = b.startClseq
+		mset.clMu.Unlock()
+		b.reset()
+		return err
+	}
+
+	if len(b.diff.msgIds) > 0 || len(b.diff.counter) > 0 || len(b.diff.inflight) > 0 || len(b.diff.inflightTransform) > 0 || len(b.diff.expectedPerSubject) > 0 {
+		b.diff.commit(mset)
+	}
+	if len(b.staged) > 0 {
+		if mset.mt == nil {
+			for _, staged := range b.staged {
+				if staged.mt != nil {
+					mset.mt = make(map[uint64]*msgTrace)
+					break
+				}
+			}
+		}
+		for _, staged := range b.staged {
+			if staged.mt != nil {
+				mset.mt[staged.clseq] = staged.mt
+			}
+		}
+	}
+
+	if mset.batches == nil {
+		mset.batches = &batching{}
+	}
+	mset.batches.mu.Lock()
+	commits := make([]stagedFastBatchProposal, 0, 1)
+	for _, staged := range b.staged {
+		staged.b.pending++
+		if staged.commit {
+			commits = append(commits, staged)
+		}
+	}
+	for _, staged := range commits {
+		if cleanup := mset.batches.fastBatchCommit(staged.b, staged.batchID, mset, staged.reply); cleanup {
+			staged.b.cleanupLocked(staged.batchID, mset.batches)
+		}
+	}
+	mset.batches.mu.Unlock()
+
+	mset.trackReplicationTraffic(node, b.totalSize, b.replicas)
+	if mset.clseq-(b.lseq+mset.clfs) > streamLagWarnThreshold {
+		lerr := fmt.Errorf("JetStream stream '%s > %s' has high message lag", b.jsa.acc().Name, b.name)
+		mset.srv.RateLimitWarnf("%s", lerr.Error())
+	}
+	b.reset()
+	return nil
+}
+
 // commitSingleMsg commits and proposes a single message to the node.
 // This is reused both for normal publishing into a stream, and for fast batch publishing.
 // mset.clMu lock must be held.
