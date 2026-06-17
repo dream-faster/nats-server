@@ -6186,7 +6186,10 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	canRespond := doAck && len(reply) > 0 && isLeader
 	outq := mset.outq
 
-	var resp = &JSPubAckResponse{}
+	// Allocated lazily only on the error/response paths below. On the success
+	// path (the common case) and on followers this stays nil, avoiding a heap
+	// allocation per message on every node in the group.
+	var resp *JSPubAckResponse
 
 	var (
 		batchId  string
@@ -6218,7 +6221,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	// Bail here if sealed.
 	if canConsistencyCheck && isSealed {
 		if canRespond && outq != nil {
-			resp.PubAck = &PubAck{Stream: name}
+			resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 			resp.Error = ApiErrors[JSStreamSealedErr]
 			b, _ := json.Marshal(resp)
 			outq.sendMsg(reply, b)
@@ -6226,8 +6229,16 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		return ApiErrors[JSStreamSealedErr]
 	}
 
-	var buf [256]byte
-	pubAck := append(buf[:0], mset.pubAck...)
+	// Only build the pubAck response prefix when we will actually respond
+	// (leader with a reply subject). Followers and no-ack paths skip this,
+	// avoiding a per-message heap allocation of the (escaping) scratch buffer.
+	// canRespond is monotonic here (only ever cleared later), so deciding on
+	// its current value is safe for the use sites below.
+	var pubAck []byte
+	if canRespond {
+		var buf [256]byte
+		pubAck = append(buf[:0], mset.pubAck...)
+	}
 
 	// If this is a non-clustered msg and we are not considered active, meaning no active subscription, do not process.
 	if lseq == 0 && ts == 0 && !mset.active {
@@ -6256,7 +6267,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// Really is a mismatch.
 			if isMisMatch {
 				if canRespond && outq != nil {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = ApiErrors[JSStreamSequenceNotMatchErr]
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6288,7 +6299,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			if incr, ok = getMessageIncr(hdr); !ok {
 				apiErr := NewJSMessageIncrInvalidError()
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = apiErr
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6299,7 +6310,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				if !allowMsgCounter {
 					apiErr := NewJSMessageIncrDisabledError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6308,7 +6319,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				} else if len(msg) > 0 {
 					apiErr := NewJSMessageIncrPayloadError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6331,7 +6342,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					if doErr {
 						apiErr := NewJSMessageIncrInvalidError()
 						if canRespond {
-							resp.PubAck = &PubAck{Stream: name}
+							resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 							resp.Error = apiErr
 							b, _ := json.Marshal(resp)
 							outq.sendMsg(reply, b)
@@ -6344,7 +6355,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// Expected stream.
 			if sname := getExpectedStream(hdr); sname != _EMPTY_ && sname != name {
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = NewJSStreamNotMatchError()
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6357,7 +6368,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// in processClusteredInboundMsg, but needed here for non-clustered etc.
 			if ttl, _ := getMessageTTL(hdr); !sourced && ttl != 0 && !mset.cfg.AllowMsgTTL {
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = NewJSMessageTTLDisabledError()
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6385,7 +6396,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				}
 				if err != nil || fseq != seq {
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = NewJSStreamWrongLastSequenceError(fseq)
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6395,7 +6406,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			} else if getExpectedLastSeqPerSubjectForSubject(hdr) != _EMPTY_ {
 				apiErr := NewJSStreamExpectedLastSeqPerSubjectInvalidError()
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = apiErr
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6407,7 +6418,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			if seq, exists := getExpectedLastSeq(hdr); exists && seq != mset.lseq {
 				mlseq := mset.lseq
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = NewJSStreamWrongLastSequenceError(mlseq)
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6423,7 +6434,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					apiErr = NewJSMessageSchedulesDisabledError()
 				}
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = apiErr
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6433,7 +6444,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				if !allowMsgSchedules {
 					apiErr := NewJSMessageSchedulesDisabledError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6442,7 +6453,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				} else if scheduleTtl, ok := getMessageScheduleTTL(hdr); !ok {
 					apiErr := NewJSMessageSchedulesTTLInvalidError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6451,7 +6462,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				} else if scheduleRollup := getMessageScheduleRollup(hdr); scheduleRollup != _EMPTY_ && scheduleRollup != JSMsgRollupSubject {
 					apiErr := NewJSMessageSchedulesRollupInvalidError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6459,7 +6470,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					return apiErr
 				} else if scheduleTtl != _EMPTY_ && !mset.cfg.AllowMsgTTL {
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = NewJSMessageTTLDisabledError()
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6469,7 +6480,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					!IsValidPublishSubject(scheduleTarget) || scheduleTarget == subject {
 					apiErr := NewJSMessageSchedulesTargetInvalidError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6479,7 +6490,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					(scheduleSource == scheduleTarget || scheduleSource == subject || !IsValidPublishSubject(scheduleSource)) {
 					apiErr := NewJSMessageSchedulesSourceInvalidError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6492,7 +6503,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					if !match {
 						apiErr := NewJSMessageSchedulesTargetInvalidError()
 						if canRespond {
-							resp.PubAck = &PubAck{Stream: name}
+							resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 							resp.Error = apiErr
 							b, _ := json.Marshal(resp)
 							outq.sendMsg(reply, b)
@@ -6506,7 +6517,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 						if !match {
 							apiErr := NewJSMessageSchedulesSourceInvalidError()
 							if canRespond {
-								resp.PubAck = &PubAck{Stream: name}
+								resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 								resp.Error = apiErr
 								b, _ := json.Marshal(resp)
 								outq.sendMsg(reply, b)
@@ -6522,7 +6533,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					} else if rollup != JSMsgRollupSubject {
 						apiErr := NewJSMessageSchedulesRollupInvalidError()
 						if canRespond {
-							resp.PubAck = &PubAck{Stream: name}
+							resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 							resp.Error = apiErr
 							b, _ := json.Marshal(resp)
 							outq.sendMsg(reply, b)
@@ -6536,7 +6547,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				if bytesToString(scheduleNext) != JSScheduleNextPurge {
 					apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6550,7 +6561,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					bytesToString(scheduler) == subject || !IsValidPublishSubject(bytesToString(scheduler)) {
 					apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6559,7 +6570,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				} else if !allowMsgSchedules {
 					apiErr := NewJSMessageSchedulesDisabledError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6575,7 +6586,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					if sm != nil && len(sliceHeader(JSSchedulePattern, sm.hdr)) == 0 {
 						apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 						if canRespond {
-							resp.PubAck = &PubAck{Stream: name}
+							resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 							resp.Error = apiErr
 							b, _ := json.Marshal(resp)
 							outq.sendMsg(reply, b)
@@ -6587,7 +6598,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				// Clients may only use Nats-Scheduler alongside Nats-Schedule-Next.
 				apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = apiErr
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6626,7 +6637,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				last := mset.lmsgId
 				bumpCLFS()
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = NewJSStreamWrongLastMsgIDError(last)
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6639,7 +6650,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			if canConsistencyCheck && !allowRollupPurge && !sourced {
 				err := errors.New("rollup not permitted")
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = NewJSStreamRollupFailedError(err)
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6655,7 +6666,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				if canConsistencyCheck {
 					err := fmt.Errorf("rollup value invalid: %q", rollup)
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = NewJSStreamRollupFailedError(err)
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6669,7 +6680,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	if canConsistencyCheck && incr == nil && allowMsgCounter {
 		apiErr := NewJSMessageIncrMissingError()
 		if canRespond {
-			resp.PubAck = &PubAck{Stream: name}
+			resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 			resp.Error = apiErr
 			b, _ := json.Marshal(resp)
 			outq.sendMsg(reply, b)
@@ -6697,7 +6708,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			if json.Unmarshal(sm.msg, &val) != nil {
 				apiErr := NewJSMessageCounterBrokenError()
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = apiErr
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6708,7 +6719,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				if err := json.Unmarshal(ncs, &sources); err != nil {
 					apiErr := NewJSMessageCounterBrokenError()
 					if canRespond {
-						resp.PubAck = &PubAck{Stream: name}
+						resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 						resp.Error = apiErr
 						b, _ := json.Marshal(resp)
 						outq.sendMsg(reply, b)
@@ -6732,7 +6743,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			if json.Unmarshal(msg, &val) != nil {
 				apiErr := NewJSMessageCounterBrokenError()
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = apiErr
 					b, _ := json.Marshal(resp)
 					outq.sendMsg(reply, b)
@@ -6767,7 +6778,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			nhdr, err := json.Marshal(sources)
 			if err != nil {
 				if canRespond {
-					resp.PubAck = &PubAck{Stream: name}
+					resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 					resp.Error = NewJSMessageCounterBrokenError()
 					response, _ = json.Marshal(resp)
 					outq.sendMsg(reply, response)
@@ -6783,7 +6794,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		hdrLen, msgLen := int64(len(hdr)), int64(len(msg))
 		if hdrLen > maxPayload || msgLen > maxPayload-hdrLen {
 			if canRespond {
-				resp.PubAck = &PubAck{Stream: name}
+				resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 				resp.Error = NewJSStreamMessageExceedsMaximumError()
 				response, _ = json.Marshal(resp)
 				outq.sendMsg(reply, response)
@@ -6796,7 +6807,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	// Subtract to prevent against overflows.
 	if canConsistencyCheck && maxMsgSize >= 0 && (len(hdr) > maxMsgSize || len(msg) > maxMsgSize-len(hdr)) {
 		if canRespond {
-			resp.PubAck = &PubAck{Stream: name}
+			resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 			resp.Error = NewJSStreamMessageExceedsMaximumError()
 			response, _ = json.Marshal(resp)
 			outq.sendMsg(reply, response)
@@ -6806,7 +6817,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 	if canConsistencyCheck && len(hdr) > math.MaxUint16 {
 		if canRespond {
-			resp.PubAck = &PubAck{Stream: name}
+			resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 			resp.Error = NewJSStreamHeaderExceedsMaximumError()
 			response, _ = json.Marshal(resp)
 			outq.sendMsg(reply, response)
@@ -6819,7 +6830,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	if !isClustered && js.limitsExceeded(stype) {
 		s.resourcesExceededError(stype)
 		if canRespond {
-			resp.PubAck = &PubAck{Stream: name}
+			resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 			resp.Error = NewJSInsufficientResourcesError()
 			response, _ = json.Marshal(resp)
 			outq.sendMsg(reply, response)
@@ -6923,7 +6934,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 			s.RateLimitWarnf("JetStream %s resource limits exceeded for account: %q", strings.ToLower(stype.String()), accName)
 			if canRespond {
-				resp.PubAck = &PubAck{Stream: name}
+				resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 				resp.Error = err
 				response, _ = json.Marshal(resp)
 				outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, nil, response, nil, 0))
@@ -6936,7 +6947,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	ttl, err := getMessageTTL(hdr)
 	if err != nil {
 		if canRespond {
-			resp.PubAck = &PubAck{Stream: name}
+			resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 			resp.Error = NewJSMessageTTLInvalidError()
 			response, _ = json.Marshal(resp)
 			outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, nil, response, nil, 0))
@@ -6989,7 +7000,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		// If we did not succeed increment clfs in case we are clustered.
 		bumpCLFS()
 		if canRespond {
-			resp.PubAck = &PubAck{Stream: name}
+			resp = &JSPubAckResponse{PubAck: &PubAck{Stream: name}}
 			resp.Error = NewJSStreamStoreFailedError(err, Unless(err))
 			response, _ = json.Marshal(resp)
 			outq.sendMsg(reply, response)

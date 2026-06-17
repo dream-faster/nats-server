@@ -7262,9 +7262,13 @@ func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg 
 		l |= hbit
 	}
 
-	// Reserve space for the header on the underlying buffer.
-	mb.cache.buf = append(mb.cache.buf, make([]byte, msgHdrSize)...)
-	hdr := mb.cache.buf[len(mb.cache.buf)-msgHdrSize : len(mb.cache.buf)]
+	// Reserve space for the header on the underlying buffer. Capacity was
+	// already ensured above (rl includes msgHdrSize), and every one of these
+	// bytes is overwritten just below, so extend in place without allocating
+	// and zeroing a throwaway slice.
+	bi := len(mb.cache.buf)
+	mb.cache.buf = mb.cache.buf[:bi+msgHdrSize]
+	hdr := mb.cache.buf[bi : bi+msgHdrSize]
 	le.PutUint32(hdr[0:], l)
 	le.PutUint64(hdr[4:], seq)
 	le.PutUint64(hdr[12:], uint64(ts))
