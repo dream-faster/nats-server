@@ -223,8 +223,9 @@ type raft struct {
 	sq    *sendq        // Send queue for outbound RPC messages
 	aesub *subscription // Subscription for handleAppendEntry callbacks
 
-	wtv []byte // Term and vote to be written
-	wps []byte // Peer state to be written
+	wtv  []byte // Term and vote to be written
+	wps  []byte // Peer state to be written
+	aeBuf []byte // Reusable AE encode buffer; valid only while n.Lock() is held.
 
 	catchup  *catchupState               // For when we need to catch up as a follower.
 	progress map[string]*ipQueue[uint64] // For leader or server catching up a follower.
@@ -2643,13 +2644,14 @@ var cePool = sync.Pool{
 type CommittedEntry struct {
 	Index   uint64
 	Entries []*Entry
+	poolBuf *[]byte // non-nil when Entries[i].Data slices reference an aeBufPool buffer.
 }
 
 // Create a new CommittedEntry. When the returned entry is no longer needed, it
 // should be returned to the pool by calling ReturnToPool.
 func newCommittedEntry(index uint64, entries []*Entry) *CommittedEntry {
 	ce := cePool.Get().(*CommittedEntry)
-	ce.Index, ce.Entries = index, entries
+	ce.Index, ce.Entries, ce.poolBuf = index, entries, nil
 	return ce
 }
 
@@ -2661,10 +2663,15 @@ func (ce *CommittedEntry) ReturnToPool() {
 	}
 	if len(ce.Entries) > 0 {
 		for _, e := range ce.Entries {
+			e.Data = nil
 			entryPool.Put(e)
 		}
 	}
 	ce.Index, ce.Entries = 0, nil
+	if ce.poolBuf != nil {
+		aeBufPool.Put(ce.poolBuf)
+		ce.poolBuf = nil
+	}
 	cePool.Put(ce)
 }
 
@@ -2690,6 +2697,15 @@ var aePool = sync.Pool{
 	},
 }
 
+// Pool for follower AE receive buffers. Each entry is a *[]byte so we can
+// resize the slice in place without re-boxing.
+var aeBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 4096)
+		return &buf
+	},
+}
+
 // appendEntry is the main struct that is used to sync raft peers.
 type appendEntry struct {
 	leader  string   // The leader that this append entry came from.
@@ -2699,22 +2715,27 @@ type appendEntry struct {
 	pindex  uint64   // The previous commit index, for checking consistency.
 	entries []*Entry // Entries to process.
 	// Below fields are for internal use only:
-	lterm uint64        // The highest term for catchups only, as the leader understands it. (If lterm=0, use term instead)
-	reply string        // Reply subject to respond to once committed.
-	sub   *subscription // The subscription that the append entry came in on.
-	buf   []byte
+	lterm   uint64        // The highest term for catchups only, as the leader understands it. (If lterm=0, use term instead)
+	reply   string        // Reply subject to respond to once committed.
+	sub     *subscription // The subscription that the append entry came in on.
+	buf     []byte
+	poolBuf *[]byte // non-nil for follower-received AEs; points to the aeBufPool buffer backing ae.buf and entry Data slices.
 }
 
 // Create a new appendEntry.
 func newAppendEntry(leader string, term, commit, pterm, pindex uint64, entries []*Entry) *appendEntry {
 	ae := aePool.Get().(*appendEntry)
 	ae.leader, ae.term, ae.commit, ae.pterm, ae.pindex, ae.entries = leader, term, commit, pterm, pindex, entries
-	ae.lterm, ae.reply, ae.sub, ae.buf = 0, _EMPTY_, nil, nil
+	ae.lterm, ae.reply, ae.sub, ae.buf, ae.poolBuf = 0, _EMPTY_, nil, nil, nil
 	return ae
 }
 
 // Will return this append entry, and its interior entries to their respective pools.
 func (ae *appendEntry) returnToPool() {
+	if ae.poolBuf != nil {
+		aeBufPool.Put(ae.poolBuf)
+		ae.poolBuf = nil
+	}
 	ae.entries, ae.buf, ae.sub, ae.reply = nil, nil, nil, _EMPTY_
 	aePool.Put(ae)
 }
@@ -3558,6 +3579,11 @@ func (n *raft) applyCommit(index uint64) error {
 
 	n.commit = index
 	ae.buf = nil
+	// Transfer poolBuf ownership to the CommittedEntry so that ReturnToPool
+	// can release the receive buffer only after the upper layer is done with
+	// all Entry.Data slices that point into it.
+	poolBuf := ae.poolBuf
+	ae.poolBuf = nil
 	var committed []*Entry
 
 	defer func() {
@@ -3566,7 +3592,9 @@ func (n *raft) applyCommit(index uint64) error {
 		// which will happen if we've processed updates inline (like peer
 		// states). In which case the upper layer will just call down with
 		// Applied() with no further action.
-		n.apply.push(newCommittedEntry(index, committed))
+		ce := newCommittedEntry(index, committed)
+		ce.poolBuf = poolBuf
+		n.apply.push(ce)
 		// Place back in the pool.
 		ae.returnToPool()
 	}()
@@ -3853,13 +3881,23 @@ func (n *raft) runAsCandidate() {
 // handleAppendEntry handles an append entry from the wire. This function
 // is an internal callback from the "asubj" append entry subscription.
 func (n *raft) handleAppendEntry(sub *subscription, c *client, _ *Account, _, reply string, msg []byte) {
-	msg = copyBytes(msg)
-	if ae, err := decodeAppendEntry(msg, sub, reply); err == nil {
+	pbuf := aeBufPool.Get().(*[]byte)
+	buf := *pbuf
+	if cap(buf) < len(msg) {
+		buf = make([]byte, len(msg))
+	} else {
+		buf = buf[:len(msg)]
+	}
+	copy(buf, msg)
+	*pbuf = buf
+	if ae, err := decodeAppendEntry(buf, sub, reply); err == nil {
+		ae.poolBuf = pbuf
 		// Push to the new entry channel. From here one of the worker
 		// goroutines (runAsLeader, runAsFollower, runAsCandidate) will
 		// pick it up.
 		n.entry.push(ae)
 	} else {
+		aeBufPool.Put(pbuf)
 		n.warn("AppendEntry failed to be placed on internal channel: corrupt entry")
 	}
 }
@@ -4354,6 +4392,13 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 				return
 			}
 
+			// ae.entries[0].Data is now a private copy and ae.entries[1].Data
+			// has been fully decoded, so we can release the receive buffer now.
+			if ae.poolBuf != nil {
+				aeBufPool.Put(ae.poolBuf)
+				ae.poolBuf = nil
+			}
+
 			// Inherit state from appendEntry with the leader's snapshot.
 			hadPreviousSnapshot := n.snapfile != _EMPTY_
 
@@ -4690,10 +4735,13 @@ func (n *raft) sendAppendEntryLocked(entries []*Entry, checkLeader bool) error {
 	ae := n.buildAppendEntry(entries)
 
 	var err error
-	var scratch [1024]byte
-	ae.buf, err = ae.encode(scratch[:])
+	ae.buf, err = ae.encode(n.aeBuf)
 	if err != nil {
 		return err
+	}
+	// Absorb any larger backing array so future encodes avoid allocating.
+	if cap(ae.buf) > cap(n.aeBuf) {
+		n.aeBuf = ae.buf[:0]
 	}
 
 	// If we have entries store this in our wal.
@@ -4706,6 +4754,10 @@ func (n *raft) sendAppendEntryLocked(entries []*Entry, checkLeader bool) error {
 		n.cachePendingEntry(ae)
 	}
 	n.sendRPC(n.asubj, n.areply, ae.buf)
+	// WAL and RPC each copy ae.buf; release it so the backing array can be
+	// reused via n.aeBuf on the next call (which will already hold it via
+	// the cap update above).
+	ae.buf = nil
 	if !shouldStore {
 		ae.returnToPool()
 	}
