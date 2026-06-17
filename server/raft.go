@@ -223,8 +223,8 @@ type raft struct {
 	sq    *sendq        // Send queue for outbound RPC messages
 	aesub *subscription // Subscription for handleAppendEntry callbacks
 
-	wtv  []byte // Term and vote to be written
-	wps  []byte // Peer state to be written
+	wtv   []byte // Term and vote to be written
+	wps   []byte // Peer state to be written
 	aeBuf []byte // Reusable AE encode buffer; valid only while n.Lock() is held.
 
 	catchup  *catchupState               // For when we need to catch up as a follower.

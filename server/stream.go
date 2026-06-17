@@ -7787,7 +7787,7 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		if !batch.commitEob && !isClustered {
 			// Preserve the original standalone behavior where the commit state is visible
 			// before the message is stored and acknowledged.
-			cleanup = batches.fastBatchCommit(b, batch.id, mset, reply)
+			batches.fastBatchCommit(b, batch.id, mset, reply)
 		}
 		if batch.commitEob {
 			// We'll try to immediately send a PubAck if we can.
