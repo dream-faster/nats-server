@@ -579,6 +579,11 @@ type stream struct {
 
 	batches    *batching   // Inflight batches prior to committing them.
 	batchApply *batchApply // State to check for batch completeness before applying it.
+
+	// Fast-batch apply optimization: accumulate usage deltas and flush once per batch.
+	// Only accessed while mset.mu is held.
+	batchingApply   bool
+	batchUsageDelta int64
 }
 
 // inflightSubjectRunningTotal stores a running total of inflight messages for a specific subject.
@@ -5222,7 +5227,13 @@ func (mset *stream) storeUpdates(md, bd int64, seq uint64, subj string) {
 	}
 
 	if mset.jsa != nil {
-		mset.jsa.updateUsage(mset.tier, mset.stype, bd)
+		// During fast-batch commit apply, accumulate storage deltas and flush once
+		// at the end to avoid N-1 extra mutex acquisitions on jsa.usageMu.
+		if mset.batchingApply && bd > 0 {
+			mset.batchUsageDelta += bd
+		} else {
+			mset.jsa.updateUsage(mset.tier, mset.stype, bd)
+		}
 	}
 }
 
@@ -7795,11 +7806,16 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		}
 	}
 
-	// The first message in the batch responds with the settings used for flow control.
-	// If committing immediately, we only send the PubAck.
-	if batch.seq == 1 && canRespond && !batch.commit {
-		buf, _ := BatchFlowAck{Sequence: 0, Messages: b.ackMessages}.MarshalJSON()
-		outq.sendMsg(reply, buf)
+	// Cache a single timestamp on the first message of the batch, reused for seq=2..N
+	// to avoid N-1 extra time.Now() calls on the proposal hot path.
+	if batch.seq == 1 {
+		b.ts = time.Now().UnixNano()
+		// The first message in the batch responds with the settings used for flow control.
+		// If committing immediately, we only send the PubAck.
+		if canRespond && !batch.commit {
+			buf, _ := BatchFlowAck{Sequence: 0, Messages: b.ackMessages}.MarshalJSON()
+			outq.sendMsg(reply, buf)
+		}
 	}
 
 	// Proceed with proposing this message.
@@ -7882,7 +7898,11 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		mset.clMu.Unlock()
 		return mset.processJetStreamMsgWithBatch(subject, reply, hdr, msg, 0, 0, mt, false, true, batch)
 	}
-	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq)
+	ts := b.ts
+	if ts == 0 {
+		ts = time.Now().UnixNano()
+	}
+	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq, ts)
 	mset.clMu.Unlock()
 	return err
 }
