@@ -7702,13 +7702,6 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 
 	// A ping operation confirms we've received a minimum amount of data and resends ack messages.
 	if batch.ping {
-		if pbuf != nil {
-			if err := pbuf.flush(mset, node); err != nil {
-				batches.mu.Unlock()
-				mset.mu.Unlock()
-				return err
-			}
-		}
 		sendFlowControl := true
 		// Detect a gap or if the batch was cleaned up in the meantime.
 		if batch.seq > b.lseq || cleanup {
@@ -7770,13 +7763,6 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 
 	if batch.commit {
 		if batch.commitEob {
-			if pbuf != nil {
-				if err := pbuf.flush(mset, node); err != nil {
-					batches.mu.Unlock()
-					mset.mu.Unlock()
-					return err
-				}
-			}
 			// Revert, since we incremented for the gap check.
 			b.lseq--
 			// If there is none pending, correct the persisted sequence as we need to commit below.

@@ -1098,6 +1098,13 @@ func (b *fastBatchProposalBuffer) reset() {
 	b.totalSize = 0
 }
 
+func (b *fastBatchProposalBuffer) returnEntriesToPool() {
+	for _, entry := range b.entries {
+		entry.Data = nil
+		entryPool.Put(entry)
+	}
+}
+
 func (b *fastBatchProposalBuffer) stage(
 	mset *stream, subject, reply string, hdr, msg []byte, mt *msgTrace, fb *FastBatch, state *fastBatch,
 	jsa *jsAccount, name string, replicas int, lseq uint64,
@@ -1143,10 +1150,12 @@ func (b *fastBatchProposalBuffer) flush(mset *stream, node RaftNode) error {
 	if len(b.staged) == 0 {
 		return nil
 	}
+
+	mset.clMu.Lock()
 	if err := node.ProposeMulti(b.entries); err != nil {
-		mset.clMu.Lock()
 		mset.clseq = b.startClseq
 		mset.clMu.Unlock()
+		b.returnEntriesToPool()
 		b.reset()
 		return err
 	}
@@ -1170,6 +1179,10 @@ func (b *fastBatchProposalBuffer) flush(mset *stream, node RaftNode) error {
 		}
 	}
 
+	lagExceeded := mset.clseq-(b.lseq+mset.clfs) > streamLagWarnThreshold
+	mset.trackReplicationTraffic(node, b.totalSize, b.replicas)
+	mset.clMu.Unlock()
+
 	if mset.batches == nil {
 		mset.batches = &batching{}
 	}
@@ -1188,8 +1201,7 @@ func (b *fastBatchProposalBuffer) flush(mset *stream, node RaftNode) error {
 	}
 	mset.batches.mu.Unlock()
 
-	mset.trackReplicationTraffic(node, b.totalSize, b.replicas)
-	if mset.clseq-(b.lseq+mset.clfs) > streamLagWarnThreshold {
+	if lagExceeded {
 		lerr := fmt.Errorf("JetStream stream '%s > %s' has high message lag", b.jsa.acc().Name, b.name)
 		mset.srv.RateLimitWarnf("%s", lerr.Error())
 	}
