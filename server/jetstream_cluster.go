@@ -4048,6 +4048,22 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					continue
 				}
 
+				// Batch the storage-usage accounting: flush one updateUsage call per
+				// batch instead of one per message, reducing jsa.usageMu contention.
+				mset.batchingApply = true
+				mset.batchUsageDelta = 0
+
+				flushBatchUsage := func() {
+					if mset.batchingApply {
+						mset.batchingApply = false
+						if mset.batchUsageDelta != 0 && mset.jsa != nil {
+							delta := mset.batchUsageDelta
+							mset.batchUsageDelta = 0
+							mset.jsa.updateUsage(mset.tier, mset.stype, delta)
+						}
+					}
+				}
+
 				// Process any entries that are part of this batch but prior to the current one.
 				var entries []*Entry
 				for j, bce := range batch.entries {
@@ -4061,6 +4077,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					for _, entry := range entries {
 						_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 						if err != nil {
+							flushBatchUsage()
 							batch.mu.Unlock()
 							mset.mu.Unlock()
 							panic(err.Error())
@@ -4071,6 +4088,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 								nce.ReturnToPool()
 							}
 							// Important to clear, otherwise we could return the entries to the pool multiple times.
+							flushBatchUsage()
 							batch.clearBatchStateLocked()
 							batch.mu.Unlock()
 							mset.mu.Unlock()
@@ -4091,19 +4109,22 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				for _, entry := range entries {
 					_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 					if err != nil {
+						flushBatchUsage()
 						batch.mu.Unlock()
 						mset.mu.Unlock()
 						panic(err.Error())
 					}
 					if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
 						// Important to clear, otherwise we could return the entries to the pool multiple times.
+						flushBatchUsage()
 						batch.clearBatchStateLocked()
 						batch.mu.Unlock()
 						mset.mu.Unlock()
 						return 0, err
 					}
 				}
-				// Clear state, batch was successful.
+				// Flush deferred usage accounting then clear batch state.
+				flushBatchUsage()
 				batch.clearBatchStateLocked()
 				batch.mu.Unlock()
 				mset.mu.Unlock()
@@ -10178,7 +10199,7 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 		return err
 	}
 
-	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq)
+	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq, time.Now().UnixNano())
 	mset.clMu.Unlock()
 	return err
 }

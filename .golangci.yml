@@ -62,6 +62,9 @@ linters:
       - linters:
           - forbidigo
         path: _test.go
+      - linters:
+          - misspell
+        source: "amortises"
     paths:
       - .github
       - doc
