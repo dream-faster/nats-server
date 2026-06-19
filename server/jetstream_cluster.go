@@ -10205,13 +10205,14 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 }
 
 func (mset *stream) getAndDeleteMsgTrace(lseq uint64) *msgTrace {
-	if mset == nil {
+	if mset == nil || mset.mtCount.Load() <= 0 {
 		return nil
 	}
 	mset.clMu.Lock()
 	mt, ok := mset.mt[lseq]
 	if ok {
 		delete(mset.mt, lseq)
+		mset.mtCount.Add(-1)
 	}
 	mset.clMu.Unlock()
 	return mt

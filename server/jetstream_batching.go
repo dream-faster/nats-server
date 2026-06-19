@@ -59,6 +59,7 @@ type fastBatch struct {
 	reply          string      // The last reply subject seen when persisting a message.
 	gapOk          bool        // Whether a gap is okay, if not, the batch would be rejected.
 	commit         bool        // If the batch is committed.
+	diff           batchStagedDiff // Reused across messages to avoid per-message map allocations.
 }
 
 // newAtomicBatch creates an atomic batch publish object.
@@ -424,6 +425,27 @@ type batchStagedDiff struct {
 type batchExpectedPerSubject struct {
 	sseq  uint64 // Stream sequence.
 	clseq uint64 // Clustered proposal sequence.
+}
+
+// reset clears all entries from diff while keeping the underlying maps allocated.
+// Called after each per-message commit in the fast-batch propose path to reuse the
+// allocations across N messages without repeatedly creating new map objects.
+func (diff *batchStagedDiff) reset() {
+	for k := range diff.msgIds {
+		delete(diff.msgIds, k)
+	}
+	for k := range diff.counter {
+		delete(diff.counter, k)
+	}
+	for k := range diff.inflight {
+		delete(diff.inflight, k)
+	}
+	for k := range diff.inflightTransform {
+		delete(diff.inflightTransform, k)
+	}
+	for k := range diff.expectedPerSubject {
+		delete(diff.expectedPerSubject, k)
+	}
 }
 
 func (diff *batchStagedDiff) commit(mset *stream) {
@@ -1078,6 +1100,7 @@ func commitSingleMsg(
 			mset.mt = make(map[uint64]*msgTrace)
 		}
 		mset.mt[mtKey] = mt
+		mset.mtCount.Add(1)
 	}
 
 	diff.commit(mset)

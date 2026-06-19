@@ -535,7 +535,8 @@ type stream struct {
 
 	// Leader will store seq/msgTrace in clustering mode. Used in applyStreamEntries
 	// to know if trace event should be sent after processing.
-	mt map[uint64]*msgTrace
+	mt      map[uint64]*msgTrace
+	mtCount atomic.Int32 // count of entries in mt; read without clMu as a fast-path gate
 
 	// For non limits policy streams when they process an ack before the actual msg.
 	// Can happen in stretch clusters, multi-cloud, or during catchup for a restarted server.
@@ -7865,8 +7866,13 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		apiErr *ApiError
 		err    error
 	)
-	diff := &batchStagedDiff{}
+	// Reuse b.diff across all messages in the batch to avoid allocating a new
+	// batchStagedDiff (and its internal maps) for each message. reset() clears
+	// the map entries but keeps the backing arrays, so subsequent messages only
+	// pay for map-entry writes rather than repeated make() calls.
+	diff := &b.diff
 	if hdr, msg, dseq, apiErr, err = checkMsgHeadersPreClusteredProposal(diff, mset, csubject, subject, hdr, msg, false, name, jsa, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules, discard, discardNewPer, maxMsgSize, maxMsgs, maxMsgsPer, maxBytes); err != nil {
+		b.diff.reset()
 		mset.clMu.Unlock()
 
 		// If the message is a duplicate, and we have no pending messages, we should check if we need to
@@ -7926,6 +7932,7 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 	b.pending++
 	batches.mu.Unlock()
 	if !isClustered {
+		b.diff.reset()
 		mset.clMu.Unlock()
 		return mset.processJetStreamMsgWithBatch(subject, reply, hdr, msg, 0, 0, mt, false, true, batch)
 	}
@@ -7934,6 +7941,11 @@ func (mset *stream) processJetStreamFastBatchMsg(batch *FastBatch, subject, repl
 		ts = time.Now().UnixNano()
 	}
 	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq, ts)
+	// Clear the diff entries now (maps stay allocated for next message) so the
+	// next message in this batch starts from a clean slate while still sharing
+	// the already-allocated map buckets. Must happen before releasing clMu so
+	// that a concurrent proposal for the same batch sees the cleared state.
+	b.diff.reset()
 	mset.clMu.Unlock()
 	return err
 }
