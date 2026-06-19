@@ -1000,7 +1000,7 @@ func BenchmarkJetStreamPublish(b *testing.B) {
 }
 
 // BenchmarkJetStreamFastBatch benchmarks the fast-batch publish path on an R3 cluster.
-// Fast-batch amortises the RAFT round-trip over N messages, shifting the bottleneck from
+// Fast-batch amortizes the RAFT round-trip over N messages, shifting the bottleneck from
 // replication latency to per-message CPU cost.  Run with:
 //
 //	go test -run='^$' -bench=BenchmarkJetStreamFastBatch -benchmem -count=5
