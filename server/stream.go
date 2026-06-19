@@ -6895,7 +6895,16 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// Check full leader state so we only send the client an update once we're caught up.
 			commit := mset.batches.fastBatchRegisterSequences(mset, reply, mset.lseq, mset.isLeader(), fastBatch)
 			mset.batches.mu.Unlock()
-			if !commit {
+			if commit {
+				// Flush any accumulated storage-usage delta (e.g. from prior stored messages in this batch).
+				if mset.batchingApply {
+					mset.batchingApply = false
+					if mset.batchUsageDelta != 0 && mset.jsa != nil {
+						mset.jsa.updateUsage(mset.tier, mset.stype, mset.batchUsageDelta)
+						mset.batchUsageDelta = 0
+					}
+				}
+			} else {
 				reply = _EMPTY_
 				canRespond = false
 			}
@@ -6974,6 +6983,19 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			ttl = minTtl
 			hdr = removeHeaderIfPresent(hdr, JSMessageTTL)
 			hdr = genHeader(hdr, JSMessageTTL, strconv.FormatInt(ttl, 10))
+		}
+	}
+
+	// Batch storage-usage accounting across messages in the same fast-batch to
+	// reduce jsa.usageMu contention. If the current call is not a fast-batch
+	// message but a previous message left batchingApply=true, flush it first.
+	if fastBatch != nil {
+		mset.batchingApply = true
+	} else if mset.batchingApply {
+		mset.batchingApply = false
+		if mset.batchUsageDelta != 0 && mset.jsa != nil {
+			mset.jsa.updateUsage(mset.tier, mset.stype, mset.batchUsageDelta)
+			mset.batchUsageDelta = 0
 		}
 	}
 
@@ -7098,7 +7120,16 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		// Check full leader state so we only send the client an update once we're caught up.
 		commit := mset.batches.fastBatchRegisterSequences(mset, reply, mset.lseq, mset.isLeader(), fastBatch)
 		mset.batches.mu.Unlock()
-		if !commit {
+		if commit {
+			// Flush accumulated storage-usage delta for this fast-batch.
+			if mset.batchingApply {
+				mset.batchingApply = false
+				if mset.batchUsageDelta != 0 && mset.jsa != nil {
+					mset.jsa.updateUsage(mset.tier, mset.stype, mset.batchUsageDelta)
+					mset.batchUsageDelta = 0
+				}
+			}
+		} else {
 			reply = _EMPTY_
 			canRespond = false
 		}
