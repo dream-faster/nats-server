@@ -3920,7 +3920,15 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 	batch := mset.batchApply
 	mset.mu.RUnlock()
 
+	// Tracks the index past a contiguous run of plain stream-message entries that
+	// were applied together under a single stream lock (see streamMsgOp below).
+	skipEntriesUntil := 0
+
 	for i, e := range ce.Entries {
+		// Already applied as part of a coalesced run below.
+		if i < skipEntriesUntil {
+			continue
+		}
 		// Ignore if lower-level catchup is started.
 		// We don't need to optimize during this, all entries are handled as normal.
 		if e.Type == EntryCatchup {
@@ -4048,6 +4056,22 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					continue
 				}
 
+				// Batch the storage-usage accounting: flush one updateUsage call per
+				// batch instead of one per message, reducing jsa.usageMu contention.
+				mset.batchingApply = true
+				mset.batchUsageDelta = 0
+
+				flushBatchUsage := func() {
+					if mset.batchingApply {
+						mset.batchingApply = false
+						if mset.batchUsageDelta != 0 && mset.jsa != nil {
+							delta := mset.batchUsageDelta
+							mset.batchUsageDelta = 0
+							mset.jsa.updateUsage(mset.tier, mset.stype, delta)
+						}
+					}
+				}
+
 				// Process any entries that are part of this batch but prior to the current one.
 				var entries []*Entry
 				for j, bce := range batch.entries {
@@ -4061,6 +4085,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 					for _, entry := range entries {
 						_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 						if err != nil {
+							flushBatchUsage()
 							batch.mu.Unlock()
 							mset.mu.Unlock()
 							panic(err.Error())
@@ -4071,6 +4096,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 								nce.ReturnToPool()
 							}
 							// Important to clear, otherwise we could return the entries to the pool multiple times.
+							flushBatchUsage()
 							batch.clearBatchStateLocked()
 							batch.mu.Unlock()
 							mset.mu.Unlock()
@@ -4091,19 +4117,22 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				for _, entry := range entries {
 					_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
 					if err != nil {
+						flushBatchUsage()
 						batch.mu.Unlock()
 						mset.mu.Unlock()
 						panic(err.Error())
 					}
 					if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
 						// Important to clear, otherwise we could return the entries to the pool multiple times.
+						flushBatchUsage()
 						batch.clearBatchStateLocked()
 						batch.mu.Unlock()
 						mset.mu.Unlock()
 						return 0, err
 					}
 				}
-				// Clear state, batch was successful.
+				// Flush deferred usage accounting then clear batch state.
+				flushBatchUsage()
 				batch.clearBatchStateLocked()
 				batch.mu.Unlock()
 				mset.mu.Unlock()
@@ -4115,9 +4144,44 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 
 			switch op {
 			case streamMsgOp, compressedStreamMsgOp:
-				mbuf := buf[1:]
-				if err := js.applyStreamMsgOp(mset, op, mbuf, isRecovering, true); err != nil {
-					return 0, err
+				// Find the end of a contiguous run of plain stream-message entries.
+				// When several arrive together (the common case for pipelined and
+				// fast-batch publishing), applying them under a single stream lock
+				// avoids acquiring/releasing mset.mu once per message, which would
+				// otherwise ping-pong the lock with the ingest path and dominates
+				// throughput contention.
+				j := i + 1
+				for j < len(ce.Entries) {
+					ne := ce.Entries[j]
+					if ne.Type != EntryNormal || len(ne.Data) == 0 {
+						break
+					}
+					if nop := entryOp(ne.Data[0]); nop != streamMsgOp && nop != compressedStreamMsgOp {
+						break
+					}
+					j++
+				}
+				if j == i+1 {
+					// Single entry: apply with its own internal locking.
+					if err := js.applyStreamMsgOp(mset, op, buf[1:], isRecovering, true); err != nil {
+						return 0, err
+					}
+				} else {
+					// Multiple consecutive entries: take the stream lock once and apply
+					// each with needLock=false (the same pattern used by atomic-batch
+					// apply). On a decode error applyStreamMsgOp releases the lock itself
+					// before panicking; on any returned error the lock is still held, so
+					// we release it here.
+					mset.mu.Lock()
+					for k := i; k < j; k++ {
+						ke := ce.Entries[k]
+						if err := js.applyStreamMsgOp(mset, entryOp(ke.Data[0]), ke.Data[1:], isRecovering, false); err != nil {
+							mset.mu.Unlock()
+							return 0, err
+						}
+					}
+					mset.mu.Unlock()
+					skipEntriesUntil = j
 				}
 
 			case deleteRangeOp:
@@ -9816,7 +9880,13 @@ func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq u
 	if len(buf) < rl {
 		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
 	}
-	reply = string(buf[:rl])
+	// Zero-copy reference into buf for the reply subject. buf here is always a
+	// GC-managed buffer (the leader's freshly-encoded proposal, a follower's
+	// copyBytes'd append entry, or a fresh copy from LoadMsg), never reused in
+	// place, so the string stays valid for as long as it's referenced. This
+	// avoids allocating the reply subject on every applied message on every
+	// node, which for fast-batch publishes is the single largest allocation.
+	reply = bytesToString(buf[:rl])
 	buf = buf[rl:]
 	if len(buf) < 2 {
 		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
@@ -10178,19 +10248,20 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 		return err
 	}
 
-	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq)
+	err = commitSingleMsg(diff, mset, subject, reply, hdr, msg, name, jsa, mt, node, r, lseq, time.Now().UnixNano())
 	mset.clMu.Unlock()
 	return err
 }
 
 func (mset *stream) getAndDeleteMsgTrace(lseq uint64) *msgTrace {
-	if mset == nil {
+	if mset == nil || mset.mtCount.Load() <= 0 {
 		return nil
 	}
 	mset.clMu.Lock()
 	mt, ok := mset.mt[lseq]
 	if ok {
 		delete(mset.mt, lseq)
+		mset.mtCount.Add(-1)
 	}
 	mset.clMu.Unlock()
 	return mt

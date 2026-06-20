@@ -16,6 +16,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -995,6 +996,114 @@ func BenchmarkJetStreamPublish(b *testing.B) {
 				}
 			},
 		)
+	}
+}
+
+// BenchmarkJetStreamFastBatch benchmarks the fast-batch publish path on an R3 cluster.
+// Fast-batch amortizes the RAFT round-trip over N messages, shifting the bottleneck from
+// replication latency to per-message CPU cost.  Run with:
+//
+//	go test -run='^$' -bench=BenchmarkJetStreamFastBatch -benchmem -count=5
+func BenchmarkJetStreamFastBatch(b *testing.B) {
+	const (
+		streamName = "FBENCH"
+		subject    = "foo"
+	)
+
+	type tc struct{ batchSize, msgSize int }
+	for _, c := range []tc{
+		{1, 64},
+		{10, 64},
+		{100, 64},
+		{500, 64},
+		{100, 1024},
+		{500, 1024},
+	} {
+		c := c
+		b.Run(fmt.Sprintf("N=3,R=3,MsgSz=%db,BatchSz=%d", c.msgSize, c.batchSize), func(b *testing.B) {
+			cl, _, shutdown, nc, _ := startJSClusterAndConnect(b, 3)
+			defer shutdown()
+			defer nc.Close()
+
+			_, err := jsStreamCreate(b, nc, &StreamConfig{
+				Name:              streamName,
+				Subjects:          []string{subject},
+				Replicas:          3,
+				Storage:           FileStorage,
+				AllowBatchPublish: true,
+			})
+			if err != nil {
+				b.Fatalf("jsStreamCreate: %v", err)
+			}
+
+			// Connect directly to the stream leader for lower variance.
+			leaderURL := cl.streamLeader("$G", streamName).ClientURL()
+			nc.Close()
+			nc, err = nats.Connect(leaderURL)
+			if err != nil {
+				b.Fatalf("connect to leader: %v", err)
+			}
+			defer nc.Close()
+
+			inbox := nats.NewInbox()
+
+			// PubAck JSON starts with {"stream":, flow acks start with {"type":.
+			// We signal ackCh only on PubAcks.
+			ackCh := make(chan struct{}, 64)
+			sub, err := nc.Subscribe(inbox+".>", func(msg *nats.Msg) {
+				if !bytes.HasPrefix(msg.Data, []byte(`{"type":`)) {
+					ackCh <- struct{}{}
+				}
+			})
+			if err != nil {
+				b.Fatalf("subscribe: %v", err)
+			}
+			defer sub.Drain()
+
+			// Pre-compute reply subjects for the fixed batch ID "b".
+			// Batch ID is reused across iterations: after each commit the server
+			// removes the batch state, so the next iteration starts fresh.
+			replies := make([]string, c.batchSize)
+			for seq := 1; seq <= c.batchSize; seq++ {
+				var op int
+				switch {
+				case c.batchSize == 1 || seq == c.batchSize:
+					op = FastBatchOpCommit
+				case seq == 1:
+					op = FastBatchOpStart
+				default:
+					op = FastBatchOpAppend
+				}
+				// flow=65535: server starts with ackMessages=min(500,65535)=500,
+				// which is >= our max batchSize, so no mid-batch flow acks.
+				replies[seq-1] = fmt.Sprintf("%s.b.%d.%s.%d.%d.$FI",
+					inbox, math.MaxUint16, FastBatchGapFail, seq, op)
+			}
+
+			payload := make([]byte, c.msgSize)
+			m := nats.NewMsg(subject)
+			m.Data = payload
+
+			// b.SetBytes reports throughput per batch; divide ns/op by batchSize for per-message cost.
+			b.SetBytes(int64(c.msgSize * c.batchSize))
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				for _, reply := range replies {
+					m.Reply = reply
+					if err := nc.PublishMsg(m); err != nil {
+						b.Fatalf("publish: %v", err)
+					}
+				}
+				select {
+				case <-ackCh:
+				case <-time.After(10 * time.Second):
+					b.Fatal("timeout waiting for PubAck")
+				}
+			}
+
+			b.StopTimer()
+		})
 	}
 }
 

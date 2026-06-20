@@ -47,17 +47,19 @@ type atomicBatch struct {
 }
 
 type fastBatch struct {
-	timer          *time.Timer // Inactivity timer for the batch.
-	lseq           uint64      // The highest sequence for this batch.
-	sseq           uint64      // Last persisted stream sequence.
-	pseq           uint64      // Last persisted batch sequence (is always lower or equal to lseq).
-	fseq           uint64      // Sequence of when we last sent a flow message (is always lower or equal to pseq).
-	pending        uint32      // Number of pending messages in the batch waiting to be persisted.
-	ackMessages    uint16      // Ack will be sent every N messages.
-	maxAckMessages uint16      // Maximum ackMessages value the client allows.
-	reply          string      // The last reply subject seen when persisting a message.
-	gapOk          bool        // Whether a gap is okay, if not, the batch would be rejected.
-	commit         bool        // If the batch is committed.
+	timer          *time.Timer     // Inactivity timer for the batch.
+	lseq           uint64          // The highest sequence for this batch.
+	sseq           uint64          // Last persisted stream sequence.
+	pseq           uint64          // Last persisted batch sequence (is always lower or equal to lseq).
+	fseq           uint64          // Sequence of when we last sent a flow message (is always lower or equal to pseq).
+	ts             int64           // Timestamp (UnixNano) cached on seq=1, reused for the whole batch.
+	pending        uint32          // Number of pending messages in the batch waiting to be persisted.
+	ackMessages    uint16          // Ack will be sent every N messages.
+	maxAckMessages uint16          // Maximum ackMessages value the client allows.
+	reply          string          // The last reply subject seen when persisting a message.
+	gapOk          bool            // Whether a gap is okay, if not, the batch would be rejected.
+	commit         bool            // If the batch is committed.
+	diff           batchStagedDiff // Reused across messages to avoid per-message map allocations.
 }
 
 // newAtomicBatch creates an atomic batch publish object.
@@ -216,21 +218,25 @@ func (batches *batching) fastBatchRegisterSequences(mset *stream, reply string, 
 			return false
 		}
 		// Otherwise, even as a follower, we record the latest state of this batch.
-		if b == nil || !b.resetCleanupTimer(mset) {
-			if b != nil {
-				// The timer couldn't be reset, this means the timer already runs and is likely
-				// waiting to acquire the lock. We reset the timer here so it doesn't clean up
-				// this batch that we're about to overwrite.
-				b.timer = nil
-			} else {
-				// If this is a new batch for us, even though we're a follower, we still need
-				// to account toward the global inflight limit.
-				globalInflightFastBatches.Add(1)
-			}
+		if b == nil {
+			// If this is a new batch for us, even though we're a follower, we still need
+			// to account toward the global inflight limit.
+			globalInflightFastBatches.Add(1)
 			// We'll need a copy as we'll use it as a key and later for cleanup.
 			batchId := copyString(batch.id)
 			b = batches.newFastBatch(mset, batchId, batch.gapOk, batch.flow)
+		} else if batch.seq <= 1 && !b.resetCleanupTimer(mset) {
+			// seq=1 with a stale batch (timer already fired): replace it.
+			// The timer couldn't be reset, this means the timer already runs and is likely
+			// waiting to acquire the lock. We reset the timer here so it doesn't clean up
+			// this batch that we're about to overwrite.
+			b.timer = nil
+			batchId := copyString(batch.id)
+			b = batches.newFastBatch(mset, batchId, batch.gapOk, batch.flow)
 		}
+		// For seq > 1 and b != nil: the cleanup timer was set 10s ago and the batch
+		// completes in milliseconds, so there is no need to push the timer forward
+		// on every message.
 		b.sseq = streamSeq
 		b.pseq, b.lseq = batch.seq, batch.seq
 		b.reply = reply
@@ -419,6 +425,27 @@ type batchStagedDiff struct {
 type batchExpectedPerSubject struct {
 	sseq  uint64 // Stream sequence.
 	clseq uint64 // Clustered proposal sequence.
+}
+
+// reset clears all entries from diff while keeping the underlying maps allocated.
+// Called after each per-message commit in the fast-batch propose path to reuse the
+// allocations across N messages without repeatedly creating new map objects.
+func (diff *batchStagedDiff) reset() {
+	for k := range diff.msgIds {
+		delete(diff.msgIds, k)
+	}
+	for k := range diff.counter {
+		delete(diff.counter, k)
+	}
+	for k := range diff.inflight {
+		delete(diff.inflight, k)
+	}
+	for k := range diff.inflightTransform {
+		delete(diff.inflightTransform, k)
+	}
+	for k := range diff.expectedPerSubject {
+		delete(diff.expectedPerSubject, k)
+	}
 }
 
 func (diff *batchStagedDiff) commit(mset *stream) {
@@ -1058,10 +1085,10 @@ func recalculateClusteredSeq(mset *stream, needStreamLock bool) (lseq uint64) {
 // mset.clMu lock must be held.
 func commitSingleMsg(
 	diff *batchStagedDiff, mset *stream, subject string, reply string, hdr []byte, msg []byte, name string,
-	jsa *jsAccount, mt *msgTrace, node RaftNode, replicas int, lseq uint64,
+	jsa *jsAccount, mt *msgTrace, node RaftNode, replicas int, lseq uint64, ts int64,
 ) error {
 	// Do proposal.
-	esm := encodeStreamMsgAllowCompress(subject, reply, hdr, msg, mset.clseq, time.Now().UnixNano(), false)
+	esm := encodeStreamMsgAllowCompress(subject, reply, hdr, msg, mset.clseq, ts, false)
 	if err := node.Propose(esm); err != nil {
 		return err
 	}
@@ -1073,6 +1100,7 @@ func commitSingleMsg(
 			mset.mt = make(map[uint64]*msgTrace)
 		}
 		mset.mt[mtKey] = mt
+		mset.mtCount.Add(1)
 	}
 
 	diff.commit(mset)
