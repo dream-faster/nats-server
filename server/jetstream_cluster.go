@@ -9837,7 +9837,13 @@ func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq u
 	if len(buf) < rl {
 		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
 	}
-	reply = string(buf[:rl])
+	// Zero-copy reference into buf for the reply subject. buf here is always a
+	// GC-managed buffer (the leader's freshly-encoded proposal, a follower's
+	// copyBytes'd append entry, or a fresh copy from LoadMsg), never reused in
+	// place, so the string stays valid for as long as it's referenced. This
+	// avoids allocating the reply subject on every applied message on every
+	// node, which for fast-batch publishes is the single largest allocation.
+	reply = bytesToString(buf[:rl])
 	buf = buf[rl:]
 	if len(buf) < 2 {
 		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
