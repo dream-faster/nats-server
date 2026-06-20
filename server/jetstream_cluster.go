@@ -3920,7 +3920,15 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 	batch := mset.batchApply
 	mset.mu.RUnlock()
 
+	// Tracks the index past a contiguous run of plain stream-message entries that
+	// were applied together under a single stream lock (see streamMsgOp below).
+	skipEntriesUntil := 0
+
 	for i, e := range ce.Entries {
+		// Already applied as part of a coalesced run below.
+		if i < skipEntriesUntil {
+			continue
+		}
 		// Ignore if lower-level catchup is started.
 		// We don't need to optimize during this, all entries are handled as normal.
 		if e.Type == EntryCatchup {
@@ -4136,9 +4144,44 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 
 			switch op {
 			case streamMsgOp, compressedStreamMsgOp:
-				mbuf := buf[1:]
-				if err := js.applyStreamMsgOp(mset, op, mbuf, isRecovering, true); err != nil {
-					return 0, err
+				// Find the end of a contiguous run of plain stream-message entries.
+				// When several arrive together (the common case for pipelined and
+				// fast-batch publishing), applying them under a single stream lock
+				// avoids acquiring/releasing mset.mu once per message, which would
+				// otherwise ping-pong the lock with the ingest path and dominates
+				// throughput contention.
+				j := i + 1
+				for j < len(ce.Entries) {
+					ne := ce.Entries[j]
+					if ne.Type != EntryNormal || len(ne.Data) == 0 {
+						break
+					}
+					if nop := entryOp(ne.Data[0]); nop != streamMsgOp && nop != compressedStreamMsgOp {
+						break
+					}
+					j++
+				}
+				if j == i+1 {
+					// Single entry: apply with its own internal locking.
+					if err := js.applyStreamMsgOp(mset, op, buf[1:], isRecovering, true); err != nil {
+						return 0, err
+					}
+				} else {
+					// Multiple consecutive entries: take the stream lock once and apply
+					// each with needLock=false (the same pattern used by atomic-batch
+					// apply). On a decode error applyStreamMsgOp releases the lock itself
+					// before panicking; on any returned error the lock is still held, so
+					// we release it here.
+					mset.mu.Lock()
+					for k := i; k < j; k++ {
+						ke := ce.Entries[k]
+						if err := js.applyStreamMsgOp(mset, entryOp(ke.Data[0]), ke.Data[1:], isRecovering, false); err != nil {
+							mset.mu.Unlock()
+							return 0, err
+						}
+					}
+					mset.mu.Unlock()
+					skipEntriesUntil = j
 				}
 
 			case deleteRangeOp:
