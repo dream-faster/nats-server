@@ -47,18 +47,18 @@ type atomicBatch struct {
 }
 
 type fastBatch struct {
-	timer          *time.Timer // Inactivity timer for the batch.
-	lseq           uint64      // The highest sequence for this batch.
-	sseq           uint64      // Last persisted stream sequence.
-	pseq           uint64      // Last persisted batch sequence (is always lower or equal to lseq).
-	fseq           uint64      // Sequence of when we last sent a flow message (is always lower or equal to pseq).
-	ts             int64       // Timestamp (UnixNano) cached on seq=1, reused for the whole batch.
-	pending        uint32      // Number of pending messages in the batch waiting to be persisted.
-	ackMessages    uint16      // Ack will be sent every N messages.
-	maxAckMessages uint16      // Maximum ackMessages value the client allows.
-	reply          string      // The last reply subject seen when persisting a message.
-	gapOk          bool        // Whether a gap is okay, if not, the batch would be rejected.
-	commit         bool        // If the batch is committed.
+	timer          *time.Timer     // Inactivity timer for the batch.
+	lseq           uint64          // The highest sequence for this batch.
+	sseq           uint64          // Last persisted stream sequence.
+	pseq           uint64          // Last persisted batch sequence (is always lower or equal to lseq).
+	fseq           uint64          // Sequence of when we last sent a flow message (is always lower or equal to pseq).
+	ts             int64           // Timestamp (UnixNano) cached on seq=1, reused for the whole batch.
+	pending        uint32          // Number of pending messages in the batch waiting to be persisted.
+	ackMessages    uint16          // Ack will be sent every N messages.
+	maxAckMessages uint16          // Maximum ackMessages value the client allows.
+	reply          string          // The last reply subject seen when persisting a message.
+	gapOk          bool            // Whether a gap is okay, if not, the batch would be rejected.
+	commit         bool            // If the batch is committed.
 	diff           batchStagedDiff // Reused across messages to avoid per-message map allocations.
 }
 
