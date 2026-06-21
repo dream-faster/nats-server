@@ -1,0 +1,28 @@
+FROM golang:1.25-alpine AS builder
+
+ARG VERSION
+ARG GIT_COMMIT
+
+ENV GO111MODULE=on \
+    CGO_ENABLED=0
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /src
+COPY . .
+
+RUN go build -trimpath \
+       -ldflags "-w -X github.com/nats-io/nats-server/v2/server.serverVersion=${VERSION},github.com/nats-io/nats-server/v2/server.gitCommit=${GIT_COMMIT}" \
+       -o /out/nats-server .
+
+FROM alpine:latest
+
+RUN apk add --no-cache tzdata ca-certificates
+
+COPY docker/nats-server.conf /nats/conf/nats-server.conf
+COPY --from=builder /out/nats-server /bin/nats-server
+
+EXPOSE 4222 8222 6222
+
+ENTRYPOINT ["/bin/nats-server"]
+CMD ["-c", "/nats/conf/nats-server.conf"]
