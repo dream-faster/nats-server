@@ -998,6 +998,122 @@ func BenchmarkJetStreamPublish(b *testing.B) {
 	}
 }
 
+func BenchmarkJetStreamFastBatchPublish(b *testing.B) {
+	const (
+		verbose     = false
+		seed        = 12345
+		streamName  = "S"
+		batchSize   = 64
+		initialFlow = 64
+	)
+
+	runFastBatchPublisher := func(b *testing.B, nc *nats.Conn, replyInbox string, messageSize int, subject string) (int, int) {
+		rng := rand.New(rand.NewSource(int64(seed)))
+		message := make([]byte, messageSize)
+		rng.Read(message)
+
+		replySubj := fmt.Sprintf("%s.>", replyInbox)
+		sub, err := nc.SubscribeSync(replySubj)
+		if err != nil {
+			b.Fatalf("Failed to subscribe to batch replies: %v", err)
+		}
+		defer sub.Drain()
+
+		published, errors := 0, 0
+		b.ResetTimer()
+
+		for published < b.N {
+			curBatch := min(batchSize, b.N-published)
+			batchID := fmt.Sprintf("bench-%d", published+1)
+
+			for i := 1; i <= curBatch; i++ {
+				fastRandomMutation(message, 10)
+				m := nats.NewMsg(subject)
+				m.Data = message
+				switch {
+				case i == 1 && curBatch == 1:
+					m.Reply = generateFastBatchReply(replyInbox, batchID, 1, initialFlow, FastBatchGapFail, FastBatchOpCommit)
+				case i == 1:
+					m.Reply = generateFastBatchReply(replyInbox, batchID, 1, initialFlow, FastBatchGapFail, FastBatchOpStart)
+				case i == curBatch:
+					m.Reply = generateFastBatchReply(replyInbox, batchID, uint64(i), initialFlow, FastBatchGapFail, FastBatchOpCommit)
+				default:
+					m.Reply = generateFastBatchReply(replyInbox, batchID, uint64(i), initialFlow, FastBatchGapFail, FastBatchOpAppend)
+				}
+				if err := nc.PublishMsg(m); err != nil {
+					errors++
+					continue
+				}
+			}
+
+			// Drain all replies for this batch, ignoring flow-control messages.
+			for {
+				rmsg, err := sub.NextMsg(30 * time.Second)
+				if err != nil {
+					b.Fatalf("Batch reply timed out: %v", err)
+				}
+				if strings.HasPrefix(string(rmsg.Data), "{\"type\":\"ack\",") {
+					continue
+				}
+				var pubAck JSPubAckResponse
+				if err := json.Unmarshal(rmsg.Data, &pubAck); err != nil {
+					b.Fatalf("Unexpected reply payload: %v", err)
+				}
+				if pubAck.Error != nil {
+					errors++
+				} else {
+					published += curBatch
+				}
+				break
+			}
+
+			if verbose {
+				b.Logf("Published %d/%d", published, b.N)
+			}
+		}
+
+		b.StopTimer()
+		return published, errors
+	}
+
+	b.Run("N=3,R=3,MsgSz=1024b,Subjs=1/Batch[W:64]", func(b *testing.B) {
+		subjects := []string{"s-1"}
+		cl, _, shutdown, nc, _ := startJSClusterAndConnect(b, 3)
+		defer shutdown()
+		defer nc.Close()
+		var err error
+
+		_, err = jsStreamCreate(b, nc, &StreamConfig{
+			Name:              streamName,
+			Subjects:          subjects,
+			Replicas:          3,
+			Storage:           FileStorage,
+			AllowBatchPublish: true,
+		})
+		if err != nil {
+			b.Fatalf("Error creating stream: %v", err)
+		}
+
+		connectURL := cl.streamLeader("$G", streamName).ClientURL()
+		nc.Close()
+		nc, err = nats.Connect(connectURL)
+		if err != nil {
+			b.Fatalf("Failed to create client connection to stream leader: %v", err)
+		}
+		defer nc.Close()
+
+		if verbose {
+			b.Logf("Running fast batch publisher with message size: %dB", 1024)
+		}
+		b.SetBytes(1024)
+		published, errors := runFastBatchPublisher(b, nc, "bench", 1024, subjects[0])
+		if published+errors != b.N {
+			b.Fatalf("Something doesn't add up: %d + %d != %d", published, errors, b.N)
+		}
+		b.ReportMetric(float64(errors)*100/float64(b.N), "%error")
+	})
+}
+
 func BenchmarkJetStreamMetaSnapshot(b *testing.B) {
 	c := createJetStreamClusterExplicit(b, "R3S", 3)
 	defer c.shutdown()

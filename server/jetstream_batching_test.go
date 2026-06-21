@@ -4171,6 +4171,71 @@ func TestJetStreamFastBatchPublishDuplicatesCluster(t *testing.T) {
 	require_Equal(t, pubAck.BatchSize, 9)
 }
 
+func TestJetStreamFastBatchBufferedPublishFlushesBeforeNormalClusteredPublish(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := jsStreamCreate(t, nc, &StreamConfig{
+		Name:              "TEST",
+		Subjects:          []string{"foo.>"},
+		Storage:           FileStorage,
+		Replicas:          3,
+		AllowBatchPublish: true,
+	})
+	require_NoError(t, err)
+
+	inbox := nats.NewInbox()
+	sub, err := nc.SubscribeSync(fmt.Sprintf("%s.>", inbox))
+	require_NoError(t, err)
+	defer sub.Drain()
+
+	msg := nats.NewMsg("foo.batch.1")
+	msg.Reply = generateFastBatchReply(inbox, "uuid", 1, 10, FastBatchGapFail, FastBatchOpStart)
+	msg.Data = []byte("batch-1")
+	require_NoError(t, nc.PublishMsg(msg))
+
+	rmsg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	var batchFlowAck BatchFlowAck
+	require_NoError(t, json.Unmarshal(rmsg.Data, &batchFlowAck))
+	require_Equal(t, batchFlowAck.Sequence, uint64(0))
+
+	pubAck, err := js.Publish("foo.normal", []byte("normal"))
+	require_NoError(t, err)
+	require_Equal(t, pubAck.Sequence, uint64(2))
+
+	msg = nats.NewMsg("foo.batch.2")
+	msg.Reply = generateFastBatchReply(inbox, "uuid", 2, 10, FastBatchGapFail, FastBatchOpCommit)
+	msg.Data = []byte("batch-2")
+	require_NoError(t, nc.PublishMsg(msg))
+
+	rmsg, err = sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	var batchPubAck JSPubAckResponse
+	require_NoError(t, json.Unmarshal(rmsg.Data, &batchPubAck))
+	require_Equal(t, batchPubAck.Sequence, uint64(3))
+	require_Equal(t, batchPubAck.BatchId, "uuid")
+	require_Equal(t, batchPubAck.BatchSize, uint64(2))
+
+	sm, err := js.GetMsg("TEST", 1)
+	require_NoError(t, err)
+	require_Equal(t, sm.Subject, "foo.batch.1")
+	require_Equal(t, string(sm.Data), "batch-1")
+
+	sm, err = js.GetMsg("TEST", 2)
+	require_NoError(t, err)
+	require_Equal(t, sm.Subject, "foo.normal")
+	require_Equal(t, string(sm.Data), "normal")
+
+	sm, err = js.GetMsg("TEST", 3)
+	require_NoError(t, err)
+	require_Equal(t, sm.Subject, "foo.batch.2")
+	require_Equal(t, string(sm.Data), "batch-2")
+}
+
 func TestJetStreamFastBatchPublishDuplicatesEobCommit(t *testing.T) {
 	test := func(t *testing.T, replicas int) {
 		c := createJetStreamClusterExplicit(t, "R3S", 3)
